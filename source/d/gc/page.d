@@ -6,6 +6,7 @@ import d.gc.block;
 import d.gc.emap;
 import d.gc.extent;
 import d.gc.size;
+import d.gc.sizeclass : BinCount;
 import d.gc.spec;
 import d.gc.util;
 
@@ -64,6 +65,22 @@ private:
 	UnusedBlockHeap unusedBlockDescriptors;
 
 	OutlinedBitmap* outlinedBitmaps;
+
+	/**
+	 * The sweep runs one block at a time, releasing the mutex in between.
+	 * `sweepNext` is the next block to visit in the ring of all blocks of the
+	 * current phase; it is fixed up when a block leaves the ring.
+	 */
+	enum SweepPhase : ubyte {
+		Idle,
+		DenseScan,
+		DenseMinimize,
+		SparseScan,
+		SparseMinimize,
+	}
+
+	SweepPhase sweepPhase;
+	BlockDescriptor* sweepNext;
 
 	import d.gc.base;
 	shared Base base;
@@ -305,11 +322,28 @@ public:
 		(cast(PageFiller*) &this).prepareGCCycleImpl(emap);
 	}
 
+	/**
+	 * Sweep this filler. The work is done one block at a time, and the mutex
+	 * is released between blocks.
+	 */
 	void collect(ref CachedExtentMap emap, ubyte gcCycle, ref CollectStats stats) shared {
-		mutex.lock();
-		scope(exit) mutex.unlock();
+		auto self = cast(PageFiller*) &this;
 
-		(cast(PageFiller*) &this).collectImpl(emap, gcCycle, stats);
+		{
+			mutex.lock();
+			scope(exit) mutex.unlock();
+
+			self.beginSweepImpl(gcCycle);
+		}
+
+		while (true) {
+			mutex.lock();
+			scope(exit) mutex.unlock();
+
+			if (!self.sweepStepImpl(emap, gcCycle, stats)) {
+				break;
+			}
+		}
 	}
 
 	/**
@@ -479,9 +513,12 @@ private:
 		}
 
 		unregisterBlock(block);
+		sweepForgetBlock(block);
 		sparseBlocks.remove(block);
 
+		auto sweepSerial = block.sweepSerial;
 		block.at(address + extraBlocks * BlockSize, false);
+		block.sweepSerial = sweepSerial;
 		sparseBlocks.insert(block);
 
 		bool dirty;
@@ -679,6 +716,7 @@ private:
 		assert(e.block is block, "Invalid Block!");
 
 		// We do not manage this block anymore.
+		sweepForgetBlock(block);
 		getAllBlocks(block.dense).remove(block);
 		unusedBlockDescriptors.insert(block);
 
@@ -819,19 +857,122 @@ private:
 		}
 	}
 
-	void collectImpl(ref CachedExtentMap emap, ubyte gcCycle, ref CollectStats stats) {
+	void beginSweepImpl(ubyte gcCycle) {
 		assert(mutex.isHeld(), "Mutex not held!");
+		assert(sweepPhase == SweepPhase.Idle, "A sweep is already running!");
 
 		auto sharedThis = cast(shared(PageFiller)*) &this;
 		sharedThis.arena.clearBinsForCollection();
 
+		sweepPhase = SweepPhase.DenseScan;
+		sweepNext = denseBlocks.first;
+	}
+
+	/**
+	 * The ring of all blocks is circular, and new blocks are inserted at its
+	 * head, so a pass walks forward from the block that was first when it
+	 * started and ends when it meets a block it already visited.
+	 */
+	BlockDescriptor* nextSweepBlock(ubyte serial) {
+		assert(mutex.isHeld(), "Mutex not held!");
+
+		auto b = sweepNext;
+		if (b is null || b.sweepSerial == serial) {
+			sweepNext = null;
+			return null;
+		}
+
+		b.sweepSerial = serial;
+		sweepNext = b.allNext;
+		return b;
+	}
+
+	/**
+	 * A block is about to leave the ring of all blocks, or to be reinitialized.
+	 */
+	void sweepForgetBlock(BlockDescriptor* block) {
+		assert(mutex.isHeld(), "Mutex not held!");
+
+		if (sweepNext is block) {
+			sweepNext = block.allNext;
+		}
+	}
+
+	/**
+	 * Do one block's worth of sweeping. Returns false when the sweep is over.
+	 */
+	bool sweepStepImpl(ref CachedExtentMap emap, ubyte gcCycle, ref CollectStats stats) {
+		assert(mutex.isHeld(), "Mutex not held!");
+
 		import d.gc.sizeclass;
-		PriorityExtentHeap[BinCount] collectedSlabs;
-		auto slabs = collectedSlabs[0 .. BinCount];
+		ubyte minimizeSerial = (gcCycle + 1) & 0xff;
 
-		collectDenseAllocations(emap, slabs, stats);
-		collectSparseAllocations(emap, slabs, gcCycle, stats);
+		while (true) {
+			final switch (sweepPhase) with(SweepPhase) {
+				case Idle:
+					return false;
 
+				case DenseScan:
+					auto b = nextSweepBlock(gcCycle);
+					if (b is null) {
+						auto tO0 = getMonotonicTime();
+						collectOutlinedBitmaps();
+						gSweepT[2] += getMonotonicTime() - tO0;
+
+						sweepPhase = DenseMinimize;
+						sweepNext = denseBlocks.first;
+						continue;
+					}
+
+					PriorityExtentHeap[BinCount] collectedSlabs;
+					collectDenseBlock(emap, b, collectedSlabs[0 .. BinCount], stats);
+					combineSweptSlabs(collectedSlabs);
+					return true;
+
+				case DenseMinimize:
+					auto b = nextSweepBlock(minimizeSerial);
+					if (b is null) {
+						sweepPhase = SparseScan;
+						sweepNext = sparseBlocks.first;
+						continue;
+					}
+
+					auto tM0 = getMonotonicTime();
+					b.minimize();
+					gSweepT[3] += getMonotonicTime() - tM0;
+					return true;
+
+				case SparseScan:
+					auto b = nextSweepBlock(gcCycle);
+					if (b is null) {
+						sweepPhase = SparseMinimize;
+						sweepNext = sparseBlocks.first;
+						continue;
+					}
+
+					PriorityExtentHeap[BinCount] collectedSlabs;
+					collectSparseBlock(emap, b, collectedSlabs[0 .. BinCount], gcCycle, stats);
+					combineSweptSlabs(collectedSlabs);
+					return true;
+
+				case SparseMinimize:
+					auto b = nextSweepBlock(minimizeSerial);
+					if (b is null) {
+						sweepPhase = Idle;
+						sweepNext = null;
+						return false;
+					}
+
+					auto tM0 = getMonotonicTime();
+					b.minimize();
+					gSweepT[6] += getMonotonicTime() - tM0;
+					return true;
+			}
+		}
+	}
+
+	void combineSweptSlabs(ref PriorityExtentHeap[BinCount] collectedSlabs) {
+		auto sharedThis = cast(shared(PageFiller)*) &this;
 		sharedThis.arena.combineBinsAfterCollection(collectedSlabs);
 	}
 
@@ -911,16 +1052,14 @@ private:
 		e.slabMetadataFlags.rawContent[nimbleIndex] = metadataFlags;
 	}
 
-	void collectDenseAllocations(ref CachedExtentMap emap,
-	                             PriorityExtentHeap[] slabs,
-								 ref CollectStats stats) {
+	void collectDenseBlock(ref CachedExtentMap emap, BlockDescriptor* block,
+	                       PriorityExtentHeap[] slabs, ref CollectStats stats) {
 		assert(mutex.isHeld(), "Mutex not held!");
 
 		PriorityExtentHeap deadExtents;
 		auto tD0 = getMonotonicTime();
 
-		for (auto r = denseBlocks.range; !r.empty; r.popFront()) {
-			auto block = r.front;
+		{
 			auto bem = emap.blockLookup(block.address);
 
 			uint i = 0;
@@ -998,40 +1137,28 @@ private:
 		}
 
 		auto tD1 = getMonotonicTime();
+
+		// Freeing the last extent of the block releases the block itself,
+		// so nothing may touch it after this point.
 		while (!deadExtents.empty) {
 			freeExtentLocked(emap, deadExtents.pop());
 		}
-		auto tD2 = getMonotonicTime();
 
-		collectOutlinedBitmaps();
-		auto tD3 = getMonotonicTime();
-		minimizeDense();
-		gSweepT[0] += tD1 - tD0; gSweepT[1] += tD2 - tD1; gSweepT[2] += tD3 - tD2; gSweepT[3] += getMonotonicTime() - tD3;
-	}
-
-	uint minimizeDense() {
-		uint n = 0;
-		for (auto r = denseBlocks.range; !r.empty; r.popFront()) {
-			auto block = r.front;
-			n += block.minimize();
-		}
-
-		return n;
+		gSweepT[0] += tD1 - tD0; gSweepT[1] += getMonotonicTime() - tD1;
 	}
 
 	/**
 	 * Sparse collection.
 	 */
-	void collectSparseAllocations(ref CachedExtentMap emap,
-	                              PriorityExtentHeap[] slabs, ubyte gcCycle,
-								  ref CollectStats stats) {
+	void collectSparseBlock(ref CachedExtentMap emap, BlockDescriptor* block,
+	                        PriorityExtentHeap[] slabs, ubyte gcCycle,
+	                        ref CollectStats stats) {
 		assert(mutex.isHeld(), "Mutex not held!");
 
 		PriorityExtentHeap deadExtents;
 		auto tS0 = getMonotonicTime();
 
-		for (auto r = sparseBlocks.range; !r.empty; r.popFront()) {
-			auto block = r.front;
+		{
 			auto bem = emap.blockLookup(block.address);
 
 			uint i = 0;
@@ -1123,19 +1250,7 @@ private:
 		while (!deadExtents.empty) {
 			freeExtentLocked(emap, deadExtents.pop());
 		}
-		auto tS2 = getMonotonicTime();
-		minimizeSparse();
-		gSweepT[4] += tS1 - tS0; gSweepT[5] += tS2 - tS1; gSweepT[6] += getMonotonicTime() - tS2;
-	}
-
-	uint minimizeSparse() {
-		uint n = 0;
-		for (auto r = sparseBlocks.range; !r.empty; r.popFront()) {
-			auto block = r.front;
-			n += block.minimize();
-		}
-
-		return n;
+		gSweepT[4] += tS1 - tS0; gSweepT[5] += getMonotonicTime() - tS1;
 	}
 
 	void freeExtentLocked(ref CachedExtentMap emap, Extent* e) {

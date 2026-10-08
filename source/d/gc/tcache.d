@@ -1077,6 +1077,9 @@ private:
 	}
 }
 
+// The verifier poisons freed slots, which is the opposite of what this test
+// looks for (dirty memory coming back after a free).
+version(Symgc_verify) {} else
 @"zero" unittest {
 	enum LargeSize = 5 * PageSize;
 	enum SmallSize = 8;

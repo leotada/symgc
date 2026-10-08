@@ -6,6 +6,12 @@ private:
 
 	Link prev;
 	Link next;
+
+public:
+	@property
+	N* nextNode() {
+		return next.node;
+	}
 }
 
 struct Ring(N, string NodeName = "rnode") {

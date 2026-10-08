@@ -90,6 +90,12 @@ private:
 
 	AllBlockRingNode allrnode;
 
+	/**
+	 * The GC cycle whose sweep has visited this block, or in which the block
+	 * was created. Zero for a block no sweep has seen.
+	 */
+	ubyte _sweepSerial;
+
 	uint usedCount;
 	uint dirtyCount;
 	ubyte generation;
@@ -152,6 +158,26 @@ public:
 	@property
 	ubyte freeRangeClass() const {
 		return (bits >> FreeRangeClassIndex) & FreeRangeClassMask;
+	}
+
+	/**
+	 * The block after this one in the ring of all blocks of its kind, or null
+	 * if this is the only one.
+	 */
+	@property
+	BlockDescriptor* allNext() {
+		auto n = allrnode.nextNode;
+		return n is &this ? null : n;
+	}
+
+	@property
+	ubyte sweepSerial() const {
+		return _sweepSerial;
+	}
+
+	@property
+	void sweepSerial(ubyte s) {
+		_sweepSerial = s;
 	}
 
 	@property
