@@ -262,6 +262,10 @@ public:
 		free(tlsSegments.ptr);
 		tlsSegments = [];
 
+		// A thread's SATB entries must not die with it (model: exitnoflush).
+		import d.gc.satb;
+		satbFlushThread();
+
 		flush();
 	}
 
@@ -326,6 +330,8 @@ public:
 	}
 
 	void free(PageDescriptor pd, void* ptr) {
+		shadeReleasedBlock(pd, ptr);
+
 		if (likely(pd.isSlab())) {
 			freeSmall(pd, ptr);
 		} else {
@@ -352,6 +358,7 @@ public:
 				__sd_gc_finalize(ptr, si.usedCapacity, finalizer);
 			}
 
+			shadeReleasedBlock(pd, ptr);
 			freeSmall(pd, ptr);
 		} else {
 			if (e.finalizer !is null) {
@@ -359,7 +366,29 @@ public:
 				__sd_gc_finalize(ptr, e.usedCapacity, e.finalizer);
 			}
 
+			shadeReleasedBlock(pd, ptr);
 			freeLarge(pd);
+		}
+	}
+
+	/**
+	 * Releasing a block deletes every pointer it holds. While a concurrent
+	 * mark is running, the targets have to be logged, or a mutator that
+	 * loaded one of them from this block beforehand can be left holding an
+	 * object that is swept (plans/audit/druntime_edge_deletions.md, items 1-4).
+	 */
+	void shadeReleasedBlock(PageDescriptor pd, void* ptr) {
+		import d.gc.satb;
+		if (likely(!satbMarking()) || !pd.containsPointers) {
+			return;
+		}
+
+		if (pd.isSlab()) {
+			auto si = SlabAllocInfo(pd, ptr);
+			satbShadeRange(si.address, binInfos[pd.extentClass.sizeClass].slotSize);
+		} else {
+			auto e = pd.extent;
+			satbShadeRange(e.address, e.size);
 		}
 	}
 
@@ -414,6 +443,13 @@ public:
 
 					triggerAllocationEvent((npages - epages) * PageSize);
 				} else if (epages > npages) {
+					// The released tail deletes the pointers it holds.
+					import d.gc.satb;
+					if (unlikely(satbMarking()) && pd.containsPointers) {
+						satbShadeRange(e.address + npages * PageSize,
+						               (epages - npages) * PageSize);
+					}
+
 					if (!shrinkLarge(pd, npages)) {
 						goto LargeResizeFailed;
 					}
@@ -1940,4 +1976,116 @@ private:
 	assert(destroyCount == oldDestroyCount);
 
 	assert(tc.allocated == tc.deallocated);
+}
+
+/**
+ * Releasing a block while a concurrent mark is running must log its pointers.
+ */
+@"satb release barrier" unittest {
+	import d.gc.satb;
+	enum LargeSize = 8 * PageSize;
+
+	ThreadCache tc;
+	tc.initialize(&gExtentMap, &gBase);
+	scope(exit) tc.destroyThread();
+
+	static bool drainedContains(void* needle) {
+		bool found;
+		satbFlushThread();
+		satbDrain((void* p) { found |= p is needle; });
+		return found;
+	}
+
+	void startMarking() {
+		satbBegin(cast(void*) 0x1000, cast(void*) (1UL << 47));
+	}
+
+	void stopMarking() {
+		satbEnd();
+		satbFlushThread();
+		satbDrain((void*) {});
+	}
+
+	// A small block that holds a pointer.
+	{
+		auto child = tc.alloc(64, true, true);
+		auto parent = cast(void**) tc.alloc(64, true, true);
+		parent[0] = child;
+
+		// Not marking: free logs nothing.
+		auto spare = cast(void**) tc.alloc(64, true, true);
+		spare[0] = child;
+		tc.free(spare);
+		assert(!drainedContains(child));
+
+		startMarking();
+		scope(exit) stopMarking();
+
+		tc.free(parent);
+		assert(drainedContains(child), "free() did not log the freed block's pointers");
+		tc.free(child);
+	}
+
+	// A no-scan block holds no pointers: nothing to log.
+	{
+		auto fake = cast(void*) 0x2000;
+		auto data = cast(void**) tc.alloc(64, false, true);
+		data[0] = fake;
+
+		startMarking();
+		scope(exit) stopMarking();
+
+		tc.free(data);
+		assert(!drainedContains(fake));
+	}
+
+	// A large block that holds a pointer.
+	{
+		auto child = tc.alloc(64, true, true);
+		auto parent = cast(void**) tc.alloc(LargeSize, true, true);
+		parent[0] = child;
+
+		startMarking();
+		scope(exit) stopMarking();
+
+		tc.free(parent);
+		assert(drainedContains(child));
+		tc.free(child);
+	}
+
+	// realloc that moves a block frees the old one: its pointers are logged.
+	{
+		auto child = tc.alloc(64, true, true);
+		auto parent = cast(void**) tc.alloc(64, true, true);
+		parent[0] = child;
+
+		startMarking();
+		scope(exit) stopMarking();
+
+		auto moved = cast(void**) tc.realloc(parent, 4096, true);
+		assert(moved !is parent);
+		assert(moved[0] is child);
+		assert(drainedContains(child));
+		tc.free(moved);
+		tc.free(child);
+	}
+
+	// realloc that shrinks a large block releases a tail: its pointers are logged.
+	{
+		auto child = tc.alloc(64, true, true);
+		auto parent = cast(void**) tc.alloc(LargeSize, true, true);
+		auto tail = cast(void**) (cast(void*) parent + 6 * PageSize);
+		tail[0] = child;
+
+		startMarking();
+		scope(exit) stopMarking();
+
+		auto shrunk = tc.realloc(parent, 4 * PageSize, true);
+		if (shrunk is parent) {
+			assert(drainedContains(child), "shrinking realloc did not log the released tail");
+		}
+
+		tc.free(shrunk);
+		tc.free(child);
+	}
 }

@@ -155,6 +155,15 @@ private:
 				continue;
 			}
 
+			// Removing a root deletes every pointer in its range (or the pin
+			// itself for an empty range). It may not have been scanned yet.
+			import d.gc.satb;
+			import symgc.intrinsics : unlikely;
+			if (unlikely(satbMarking())) {
+				satbLog(roots[i].ptr);
+				satbShadeRange(roots[i].ptr, roots[i].length * PointerSize);
+			}
+
 			auto length = roots.length - 1;
 			roots[i] = roots[length];
 			roots[length] = [];
@@ -241,4 +250,29 @@ shared GCState gState;
 	foreach(p; unpinMe) {
 		__sd_gc_remove_roots(p);
 	}
+}
+
+@"satb removeRoots" unittest {
+	import d.gc.satb;
+	import d.gc.capi;
+
+	void*[4] area;
+	void* target = cast(void*) 0x1008;
+	area[1] = target;
+
+	__sd_gc_add_roots(area[]);
+
+	satbBegin(cast(void*) 0x1000, cast(void*) (1UL << 47));
+	scope(exit) {
+		satbEnd();
+		satbFlushThread();
+		satbDrain((void*) {});
+	}
+
+	__sd_gc_remove_roots(area.ptr);
+
+	bool found;
+	satbFlushThread();
+	satbDrain((void* p) { found |= p is target; });
+	assert(found, "removeRoots did not log the pointers of the removed range");
 }
