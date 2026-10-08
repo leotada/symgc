@@ -360,6 +360,15 @@ public:
 		bits += AllocScoreUnit;
 	}
 
+	/**
+	 * How many pages `minimize` would give back to the OS right now.
+	 */
+	@property
+	uint purgeablePages() const {
+		auto n = dirtyCount - usedCount;
+		return n < PurgePageThresold ? 0 : n;
+	}
+
 	uint minimize() {
 		// If there aren't enough pages to purge, do nothing.
 		auto n = dirtyCount - usedCount;

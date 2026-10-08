@@ -233,6 +233,10 @@ package:
 		return filler.collect(emap, gcCycle, stats);
 	}
 
+	bool assistSweep(ref CachedExtentMap emap) shared {
+		return filler.assistSweep(emap);
+	}
+
 	void clearBinsForCollection() shared {
 		foreach (i; 0 .. BinCount) {
 			bins[i].clearForCollection();

@@ -15,6 +15,31 @@ import symgc.intrinsics;
 import d.gc.time;
 __gshared ulong[8] gSweepT;
 
+/**
+ * The share of the time, in percent, the background sweeper may run. 100
+ * disables pacing.
+ */
+__gshared uint gSweepDutyPercent = 50;
+
+/**
+ * The sweeper stops pacing itself when the heap, in pages, grows past this
+ * limit during a sweep. The collector sets it when the sweep starts.
+ */
+__gshared size_t gSweepGrowthLimit = size_t.max;
+
+/**
+ * Past this heap size, in pages, a thread that is about to allocate helps
+ * with the sweep instead of letting the heap grow. The collector sets it
+ * when the sweep starts.
+ */
+__gshared size_t gSweepHardLimit = size_t.max;
+
+/**
+ * How many free pages each arena keeps warm during a sweep instead of
+ * returning them to the OS. The collector sets it when the sweep starts.
+ */
+__gshared size_t gSweepRetainPages = 0;
+
 struct PageFiller {
 private:
 	@property package
@@ -81,6 +106,24 @@ private:
 
 	SweepPhase sweepPhase;
 	BlockDescriptor* sweepNext;
+
+	// The block a scan is in the middle of, and the page to resume at.
+	BlockDescriptor* sweepCurrent;
+	uint sweepPage;
+
+	// The cycle being swept, and what the sweep found so far.
+	ubyte sweepGcCycle;
+	CollectStats sweepStats;
+
+	// A step is running. See `sweepStep`.
+	bool sweepStepping;
+
+	// How many more free pages this sweep may keep instead of returning them
+	// to the OS, see `minimizeBlock`.
+	size_t sweepRetain;
+
+	// A step holds the lock for about this long (time unit is 100 ns).
+	enum SweepStepBudget = 100;
 
 	import d.gc.base;
 	shared Base base;
@@ -336,14 +379,94 @@ public:
 			self.beginSweepImpl(gcCycle);
 		}
 
-		while (true) {
+		// Mutators may do some of the work too, see `assistSweep`, so the
+		// stats of the sweep live in the filler.
+		scope(exit) {
 			mutex.lock();
 			scope(exit) mutex.unlock();
 
-			if (!self.sweepStepImpl(emap, gcCycle, stats)) {
+			stats.bytesCollected += self.sweepStats.bytesCollected;
+			stats.pagesCommitted += self.sweepStats.pagesCommitted;
+			stats.bytesAllocated += self.sweepStats.bytesAllocated;
+		}
+
+		/**
+		 * Mutators allocate while we sweep and need this lock for new slabs
+		 * and large allocations. A plain unlock followed by a lock lets us
+		 * barge in again before a waiter wakes up, so hand the lock over.
+		 */
+		ulong owed = 0;
+		while (true) {
+			bool more;
+			ulong spent;
+
+			{
+				mutex.lock();
+				scope(exit) mutex.unlockFairly();
+
+				auto tStep = getMonotonicTime();
+				more = self.sweepStep(emap, gcCycle, self.sweepStats);
+				spent = getMonotonicTime() - tStep;
+
+				version(Symgc_phase_trace) {
+					// Longest time the lock was held by one step.
+					if (spent > gSweepT[7]) {
+						gSweepT[7] = spent;
+					}
+				}
+			}
+
+			if (!more) {
 				break;
 			}
+
+			/**
+			 * A mutator that wants the lock spins in short bursts, and we
+			 * would take the lock again before it looks. Let it have it.
+			 */
+			import symgc.thread : sched_yield;
+			for (uint i = 0; mutex.hasContenders && i < 64; i++) {
+				sched_yield();
+			}
+
+			owed = paceSweeper(owed, spent);
 		}
+	}
+
+	/**
+	 * A sweeper that runs flat out slows the mutators down, a lot more than
+	 * its share of the CPU would suggest (measured: a 2 GiB heap, the frame
+	 * time of the thread that allocates goes from 0.8 ms to 8 to 10 ms while
+	 * the sweep runs). So the sweeper is paced: it sleeps after each step to
+	 * stay under `gSweepDutyPercent` of the time, unless the heap is growing
+	 * quickly, in which case the sweep must end sooner than the next cycle.
+	 *
+	 * `owed` is the sleep we did not take yet, to avoid many tiny sleeps.
+	 */
+	static ulong paceSweeper(ulong owed, ulong spent) {
+		auto duty = gSweepDutyPercent;
+		if (duty >= 100) {
+			return 0;
+		}
+
+		if (Arena.computeUsedPageCount() > gSweepGrowthLimit) {
+			return 0;
+		}
+
+		// Time unit is 100 ns.
+		owed += spent * (100 - duty) / duty;
+		enum MinSleep = 1000; // 100 us
+		if (owed < MinSleep) {
+			return owed;
+		}
+
+		auto t0 = getMonotonicTime();
+
+		import core.sys.posix.unistd : usleep;
+		usleep(cast(uint) (owed / 10));
+
+		auto slept = getMonotonicTime() - t0;
+		return slept >= owed ? 0 : owed - slept;
 	}
 
 	/**
@@ -379,7 +502,11 @@ private:
 		usedPageCount.fetchAdd(pages);
 
 		auto ptr = block.address + n * PageSize;
-		return e.at(ptr, pages, block, ec);
+		e.at(ptr, pages, block, ec);
+
+		// Created while a sweep runs: the sweep must leave it alone.
+		e.sweepTag = gSweepCycle.load();
+		return e;
 	}
 
 	Extent* allocHugeImpl(uint pages, uint extraBlocks) {
@@ -413,7 +540,9 @@ private:
 		import d.gc.memmap;
 		pages_commit(ptr, leadSize);
 
-		return e.at(ptr, npages, block);
+		e.at(ptr, npages, block);
+		e.sweepTag = gSweepCycle.load();
+		return e;
 	}
 
 	void freePagesImpl(Extent* e) {
@@ -706,6 +835,11 @@ private:
 		assert(block !is null);
 
 		block.at(address, Dense);
+
+		// Created while a sweep runs: there is nothing in it to sweep, and
+		// it may not be in the extent map yet.
+		block.sweepSerial = gSweepCycle.load();
+
 		getAllBlocks(Dense).insert(block);
 		return block;
 	}
@@ -857,15 +991,82 @@ private:
 		}
 	}
 
+	/**
+	 * A mutator that allocates faster than the sweeper reclaims helps with
+	 * the sweep: it does one step, and returns whether there is more to do.
+	 */
+	package bool assistSweep(ref CachedExtentMap emap) shared {
+		auto self = cast(PageFiller*) &this;
+
+		mutex.lock();
+		scope(exit) mutex.unlockFairly();
+
+		if (self.sweepPhase == SweepPhase.Idle) {
+			return false;
+		}
+
+		return self.sweepStep(emap, self.sweepGcCycle, self.sweepStats);
+	}
+
+	/**
+	 * Give the free pages of a block back to the OS, except for a budget of
+	 * pages that we keep warm. Returning every free page to the OS right away
+	 * makes a program that allocates a lot pay for the system call, and then
+	 * for the page faults when it uses the pages again, every cycle: in the
+	 * `alloc` benchmark it is 30% of the time.
+	 */
+	void minimizeBlock(BlockDescriptor* block) {
+		auto n = block.purgeablePages;
+		if (n == 0) {
+			return;
+		}
+
+		if (n <= sweepRetain) {
+			sweepRetain -= n;
+			return;
+		}
+
+		block.minimize();
+	}
+
+	/**
+	 * Freeing pages can release the mutex for a moment, and the sweeper and
+	 * the assisting mutators all drive the same state machine. Only one of
+	 * them may be in a step at a time. Returns true if there is more to do,
+	 * which includes "someone else is stepping".
+	 */
+	bool sweepStep(ref CachedExtentMap emap, ubyte gcCycle, ref CollectStats stats) {
+		assert(mutex.isHeld(), "Mutex not held!");
+
+		if (sweepPhase == SweepPhase.Idle) {
+			return false;
+		}
+
+		if (sweepStepping) {
+			return true;
+		}
+
+		sweepStepping = true;
+		scope(exit) sweepStepping = false;
+
+		return sweepStepImpl(emap, gcCycle, stats);
+	}
+
 	void beginSweepImpl(ubyte gcCycle) {
 		assert(mutex.isHeld(), "Mutex not held!");
 		assert(sweepPhase == SweepPhase.Idle, "A sweep is already running!");
 
-		auto sharedThis = cast(shared(PageFiller)*) &this;
-		sharedThis.arena.clearBinsForCollection();
+		sweepGcCycle = gcCycle;
+		sweepStats = CollectStats();
 
+		// The heap grows back to the collection target before the next
+		// cycle, so there is no point in returning that much to the OS.
+		enum MinRetainedPages = 1024;
+		sweepRetain = max(MinRetainedPages, gSweepRetainPages);
+
+		// The bins were emptied while the world was stopped (`cycleStart`).
 		sweepPhase = SweepPhase.DenseScan;
-		sweepNext = denseBlocks.first;
+		sweepNext = firstUnvisited(denseBlocks, gcCycle);
 	}
 
 	/**
@@ -873,6 +1074,29 @@ private:
 	 * head, so a pass walks forward from the block that was first when it
 	 * started and ends when it meets a block it already visited.
 	 */
+	/**
+	 * Where a pass starts: the first block that it has not visited. Blocks
+	 * created since the pass before are at the head of the ring, and are
+	 * tagged as visited, so they must be skipped, or the pass would end
+	 * before it started.
+	 */
+	BlockDescriptor* firstUnvisited(ref AllBlockRing ring, ubyte serial) {
+		auto start = ring.first;
+		auto b = start;
+		while (b !is null) {
+			if (b.sweepSerial != serial) {
+				return b;
+			}
+
+			b = b.allNext;
+			if (b is start) {
+				break;
+			}
+		}
+
+		return null;
+	}
+
 	BlockDescriptor* nextSweepBlock(ubyte serial) {
 		assert(mutex.isHeld(), "Mutex not held!");
 
@@ -896,6 +1120,12 @@ private:
 		if (sweepNext is block) {
 			sweepNext = block.allNext;
 		}
+
+		// A block that leaves the ring is empty, or about to be reused for a
+		// single huge allocation: nothing is left to sweep in it.
+		if (sweepCurrent is block) {
+			sweepCurrent = null;
+		}
 	}
 
 	/**
@@ -913,46 +1143,57 @@ private:
 					return false;
 
 				case DenseScan:
-					auto b = nextSweepBlock(gcCycle);
-					if (b is null) {
+					if (sweepCurrent is null) {
+						sweepCurrent = nextSweepBlock(gcCycle);
+						sweepPage = 0;
+					}
+
+					if (sweepCurrent is null) {
 						auto tO0 = getMonotonicTime();
 						collectOutlinedBitmaps();
 						gSweepT[2] += getMonotonicTime() - tO0;
 
 						sweepPhase = DenseMinimize;
-						sweepNext = denseBlocks.first;
+						sweepNext = firstUnvisited(denseBlocks, minimizeSerial);
 						continue;
 					}
 
-					PriorityExtentHeap[BinCount] collectedSlabs;
-					collectDenseBlock(emap, b, collectedSlabs[0 .. BinCount], stats);
-					combineSweptSlabs(collectedSlabs);
+					// This may release the block, see `sweepForgetBlock`.
+					if (collectDenseBlock(emap, sweepCurrent, sweepPage, SweepStepBudget, gcCycle, stats)) {
+						sweepCurrent = null;
+					}
+
 					return true;
 
 				case DenseMinimize:
 					auto b = nextSweepBlock(minimizeSerial);
 					if (b is null) {
 						sweepPhase = SparseScan;
-						sweepNext = sparseBlocks.first;
+						sweepNext = firstUnvisited(sparseBlocks, gcCycle);
 						continue;
 					}
 
 					auto tM0 = getMonotonicTime();
-					b.minimize();
+					minimizeBlock(b);
 					gSweepT[3] += getMonotonicTime() - tM0;
 					return true;
 
 				case SparseScan:
-					auto b = nextSweepBlock(gcCycle);
-					if (b is null) {
+					if (sweepCurrent is null) {
+						sweepCurrent = nextSweepBlock(gcCycle);
+						sweepPage = 0;
+					}
+
+					if (sweepCurrent is null) {
 						sweepPhase = SparseMinimize;
-						sweepNext = sparseBlocks.first;
+						sweepNext = firstUnvisited(sparseBlocks, minimizeSerial);
 						continue;
 					}
 
-					PriorityExtentHeap[BinCount] collectedSlabs;
-					collectSparseBlock(emap, b, collectedSlabs[0 .. BinCount], gcCycle, stats);
-					combineSweptSlabs(collectedSlabs);
+					if (collectSparseBlock(emap, sweepCurrent, sweepPage, SweepStepBudget, gcCycle, stats)) {
+						sweepCurrent = null;
+					}
+
 					return true;
 
 				case SparseMinimize:
@@ -960,21 +1201,30 @@ private:
 					if (b is null) {
 						sweepPhase = Idle;
 						sweepNext = null;
+
+						version(Symgc_verify) {
+							// Every block was visited by the scan and by the
+							// minimize pass, or was created during the sweep.
+							foreach (ring; [&denseBlocks, &sparseBlocks]) {
+								for (auto r = ring.range; !r.empty; r.popFront()) {
+									auto s = r.front.sweepSerial;
+									assert(s == gcCycle || s == minimizeSerial,
+									       "A block was not swept!");
+								}
+							}
+						}
+
 						return false;
 					}
 
 					auto tM0 = getMonotonicTime();
-					b.minimize();
+					minimizeBlock(b);
 					gSweepT[6] += getMonotonicTime() - tM0;
 					return true;
 			}
 		}
 	}
 
-	void combineSweptSlabs(ref PriorityExtentHeap[BinCount] collectedSlabs) {
-		auto sharedThis = cast(shared(PageFiller)*) &this;
-		sharedThis.arena.combineBinsAfterCollection(collectedSlabs);
-	}
 
 	/**
 	 * Dense collection.
@@ -1044,26 +1294,122 @@ private:
 		}
 
 		/**
-		 * /!\ This is not atomic. If we want to collect concurrently, we'll
-		 *     need to do this atomically. This will do for now.
+		 * Clear the metadata of the elements we collected. This is atomic,
+		 * because mutators clear and set flags of other slots of the same
+		 * slab while we sweep it.
 		 */
-		// Clear the metadata of element we collected.
-		metadataFlags &= ~evicted;
-		e.slabMetadataFlags.rawContent[nimbleIndex] = metadataFlags;
+		auto toClear = evicted & metadataFlags;
+		while (toClear != 0) {
+			auto index = countTrailingZeros(toClear);
+			e.slabMetadataFlags.clearBitAtomic(cast(uint) (nimbleIndex * 64 + index));
+			toClear &= (toClear - 1);
+		}
 	}
 
-	void collectDenseBlock(ref CachedExtentMap emap, BlockDescriptor* block,
-	                       PriorityExtentHeap[] slabs, ref CollectStats stats) {
+	/**
+	 * Sweep one slab. Returns true if it is empty, in which case the caller
+	 * frees it.
+	 *
+	 * Mutators run during the sweep. They never allocate from a slab that is
+	 * not in a bin, and the bins were emptied while the world was stopped, so
+	 * nothing is allocated from this slab until we put it back. They can free
+	 * into it though (explicit free, thread cache flush): that clears slots
+	 * and nothing else, see `Bin.batchFreeImpl`. The steps are:
+	 *
+	 *  1. Find the dead slots. A slot that is dead now stays dead: nobody
+	 *     holds a pointer to it, and only live slots are freed.
+	 *  2. Run finalizers and poison, outside of any lock.
+	 *  3. Under the bin lock, clear the dead slots (a free may have cleared
+	 *     others since step 1), mark the slab swept, and put it back in its
+	 *     bin if it has room.
+	 */
+	bool sweepSlab(Extent* e, int sc, bool supportsMetadata,
+	               const(ulong)* marks, uint nimble, ubyte gcCycle,
+	               ref CollectStats stats) {
+		assert(nimble <= 8, "Too many nimbles!");
+
+		import d.gc.slab;
+		auto sharedThis = cast(shared(PageFiller)*) &this;
+		auto bin = &sharedThis.arena.bins[sc];
+		auto slotSize = binInfos[sc].slotSize;
+
+		/**
+		 * No lock for this read: a concurrent free can only clear a bit, and
+		 * it only frees live slots, which are marked and so are not in
+		 * `evicted` either way.
+		 */
+		ulong[8] evicted;
+		foreach (j; 0 .. nimble) {
+			evicted[j] = e.slabData.rawContent[j] & ~marks[j];
+		}
+
+		foreach (j; 0 .. nimble) {
+			if (supportsMetadata) {
+				finalizeSlabNimble(evicted[j], e.slabMetadataFlags.rawContent[j], sc, e, j);
+			}
+
+			version(Symgc_verify) {
+				poisonEvictedSlots(evicted[j], sc, e, j);
+			}
+		}
+
+		bin.mutex.lock();
+		scope(exit) bin.mutex.unlock();
+
+		uint count = 0;
+		ulong occupancy = 0;
+		foreach (j; 0 .. nimble) {
+			auto occ = e.slabData.rawContent[j] & ~evicted[j];
+			e.slabData.rawContent[j] = occ;
+			occupancy |= occ;
+			count += popCount(evicted[j]);
+		}
+
+		stats.bytesCollected += count * slotSize;
+		e.bits += count * Extent.FreeSlotsUnit;
+		e.sweepTag = gcCycle;
+
+		// The slab is empty.
+		if (occupancy == 0) {
+			return true;
+		}
+
+		auto nfree = e.nfree;
+		if (nfree > 0) {
+			import d.gc.bin;
+			(cast(Bin*) bin).slabs.insert(e);
+		}
+
+		stats.bytesAllocated += (binInfos[sc].nslots - nfree) * slotSize;
+		stats.pagesCommitted += binInfos[sc].npages;
+		return false;
+	}
+
+	/**
+	 * Sweep the dense slabs of a block, starting at page `i`, for no longer
+	 * than `budget` (the sweep holds the lock, and a mutator that wants it
+	 * waits for the rest of our step). Returns true when the block is done.
+	 * When it returns false, `i` is where to resume.
+	 */
+	bool collectDenseBlock(ref CachedExtentMap emap, BlockDescriptor* block,
+	                       ref uint i, ulong budget, ubyte gcCycle,
+	                       ref CollectStats stats) {
 		assert(mutex.isHeld(), "Mutex not held!");
 
 		PriorityExtentHeap deadExtents;
 		auto tD0 = getMonotonicTime();
+		auto deadline = tD0 + budget;
 
+		bool done = true;
 		{
 			auto bem = emap.blockLookup(block.address);
 
-			uint i = 0;
 			while (i < PagesInBlock) {
+				if (getMonotonicTime() >= deadline) {
+					done = false;
+					break;
+				}
+
 				i = block.nextAllocatedPage(i);
 				if (i >= PagesInBlock) {
 					break;
@@ -1071,7 +1417,18 @@ private:
 
 				auto pd = bem.lookup(i);
 				auto e = pd.extent;
-				assert(e !is null);
+
+				/**
+				 * A thread reserved this page (under the lock we hold) but
+				 * has not registered its extent in the map yet. It was born
+				 * after the mark: leave it alone, one page at a time as we
+				 * do not know how long the run is.
+				 */
+				if (e is null) {
+					i++;
+					continue;
+				}
+
 				assert(e.isSlab());
 
 				auto ec = pd.extentClass;
@@ -1086,53 +1443,19 @@ private:
 				auto nslots = binInfos[sc].nslots;
 				auto nimble = alignUp(nslots, 64) / 64;
 
-				ulong* bmp = e.getMarksDenseAndClearOutlines();
-
-				assert(bmp !is null);
-
-				uint count = 0;
-				ulong occupancyMask = 0;
-
-				foreach (j; 0 .. nimble) {
-					auto oldOccupancy = e.slabData.rawContent[j];
-					auto newOccupancy = oldOccupancy & bmp[j];
-
-					occupancyMask |= newOccupancy;
-					auto evicted = oldOccupancy ^ newOccupancy;
-					count += popCount(evicted);
-
-					// Declared first, so it runs after the occupancy update below.
-					version(Symgc_verify) {
-						scope(success) poisonEvictedSlots(evicted, sc, e, j);
-					}
-
-					scope(success) e.slabData.rawContent[j] = newOccupancy;
-
-					if (!ec.supportsMetadata) {
-						continue;
-					}
-
-					auto metadataFlags = e.slabMetadataFlags.rawContent[j];
-					finalizeSlabNimble(evicted, metadataFlags, sc, e, j);
-				}
-
-				stats.bytesCollected += count * binInfos[sc].slotSize;
-
-				// The slab is empty.
-				if (occupancyMask == 0) {
-					deadExtents.insert(e);
+				// Created after the mark: nothing to sweep. It is not counted
+				// in the stats either: they estimate what survived, which
+				// sets the next collection target.
+				if (e.sweepTag == gcCycle) {
 					continue;
 				}
 
-				e.bits += count * Extent.FreeSlotsUnit;
-				auto nfree = e.nfree;
+				ulong* bmp = e.getMarksDenseAndClearOutlines();
+				assert(bmp !is null);
 
-				if (nfree > 0) {
-					slabs[ec.sizeClass].insert(e);
+				if (sweepSlab(e, sc, ec.supportsMetadata, bmp, cast(uint) nimble, gcCycle, stats)) {
+					deadExtents.insert(e);
 				}
-
-				stats.bytesAllocated += (binInfos[sc].nslots - nfree) * binInfos[sc].slotSize;
-				stats.pagesCommitted += binInfos[sc].npages;
 			}
 		}
 
@@ -1145,24 +1468,31 @@ private:
 		}
 
 		gSweepT[0] += tD1 - tD0; gSweepT[1] += getMonotonicTime() - tD1;
+		return done;
 	}
 
 	/**
-	 * Sparse collection.
+	 * Sparse collection, see `collectDenseBlock` for the arguments.
 	 */
-	void collectSparseBlock(ref CachedExtentMap emap, BlockDescriptor* block,
-	                        PriorityExtentHeap[] slabs, ubyte gcCycle,
+	bool collectSparseBlock(ref CachedExtentMap emap, BlockDescriptor* block,
+	                        ref uint i, ulong budget, ubyte gcCycle,
 	                        ref CollectStats stats) {
 		assert(mutex.isHeld(), "Mutex not held!");
 
 		PriorityExtentHeap deadExtents;
 		auto tS0 = getMonotonicTime();
+		auto deadline = tS0 + budget;
 
+		bool done = true;
 		{
 			auto bem = emap.blockLookup(block.address);
 
-			uint i = 0;
 			while (i < PagesInBlock) {
+				if (getMonotonicTime() >= deadline) {
+					done = false;
+					break;
+				}
+
 				i = block.nextAllocatedPage(i);
 				if (i >= PagesInBlock) {
 					break;
@@ -1170,12 +1500,23 @@ private:
 
 				auto pd = bem.lookup(i);
 				auto e = pd.extent;
-				assert(e !is null, "GC Metadata leftovers?");
+
+				// An allocation in flight, see collectDenseBlock.
+				if (e is null) {
+					i++;
+					continue;
+				}
 
 				auto npages = e.npages;
 				scope(success) i += npages;
 
 				auto ec = pd.extentClass;
+
+				// Created after the mark: nothing to sweep, nor to count.
+				if (e.sweepTag == gcCycle) {
+					continue;
+				}
+
 				if (ec.isLarge()) {
 					// Make sure we handle huge extents correctly.
 					npages = modUp(npages, PagesInBlock);
@@ -1198,51 +1539,13 @@ private:
 					continue;
 				}
 
-				auto markBits = e.getMarksSparse(gcCycle);
+				// Sparse slabs have at most 64 slots: one nimble.
+				ulong[1] marks;
+				marks[0] = e.getMarksSparse(gcCycle);
 
-				auto metadataFlags = e.slabMetadataFlags.rawContent[0];
-
-				// If completely empty and no metadata exists,
-				// we can short circuit here.
-				if (markBits == 0 && metadataFlags == 0) {
-					version(Symgc_verify) {
-						poisonEvictedSlots(e.slabData.rawContent[0], ec.sizeClass, e, 0);
-					}
-
+				if (sweepSlab(e, ec.sizeClass, true, marks.ptr, 1, gcCycle, stats)) {
 					deadExtents.insert(e);
-					continue;
 				}
-
-				auto oldOccupancy = e.slabData.rawContent[0];
-				auto newOccupancy = oldOccupancy & markBits;
-				auto evicted = oldOccupancy ^ newOccupancy;
-				auto sc = ec.sizeClass;
-
-				// Call any finalizers on dying slots.
-				finalizeSlabNimble(evicted, metadataFlags, sc, e, 0);
-				version(Symgc_verify) {
-					poisonEvictedSlots(evicted, sc, e, 0);
-				}
-
-				auto count = popCount(evicted);
-				stats.bytesCollected += count * binInfos[sc].slotSize;
-
-				// The slab is empty.
-				if (newOccupancy == 0) {
-					deadExtents.insert(e);
-					continue;
-				}
-
-				e.slabData.rawContent[0] = newOccupancy;
-				e.bits += count * Extent.FreeSlotsUnit;
-
-				auto nfree = e.nfree;
-				if (nfree > 0) {
-					slabs[sc].insert(e);
-				}
-
-				stats.bytesAllocated += (binInfos[sc].nslots - nfree) * binInfos[sc].slotSize;
-				stats.pagesCommitted += npages;
 			}
 		}
 
@@ -1251,6 +1554,7 @@ private:
 			freeExtentLocked(emap, deadExtents.pop());
 		}
 		gSweepT[4] += tS1 - tS0; gSweepT[5] += getMonotonicTime() - tS1;
+		return done;
 	}
 
 	void freeExtentLocked(ref CachedExtentMap emap, Extent* e) {

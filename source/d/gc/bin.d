@@ -179,6 +179,16 @@ private:
 
 			e.free(se.index);
 
+			/**
+			 * The sweep has not visited this slab yet: it is not in the
+			 * bin, and the sweep will decide what to do with it, including
+			 * inserting it, or freeing it if it is empty. Doing it here
+			 * would insert it twice, or free it from under the sweep.
+			 */
+			if (unlikely(e.isUnswept)) {
+				continue;
+			}
+
 			auto nfree = e.nfree;
 			if (nfree == nslots) {
 				// If we only had one slot, we never got added to the heap.

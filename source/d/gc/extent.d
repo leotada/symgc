@@ -94,6 +94,12 @@ struct ExtentClass {
 	}
 }
 
+/**
+ * The GC cycle whose sweep is running, or 0 when no sweep is running.
+ * Set while the world is stopped, cleared when every arena is swept.
+ */
+shared Atomic!ubyte gSweepCycle;
+
 struct Extent {
 private:
 	/**
@@ -148,9 +154,13 @@ private:
 
 	GCMetadata _gcMetadata;
 
-	// TODO: Reuse this data to do something useful,
-	// like garbage collection :P
-	void* _pad1;
+	/**
+	 * The GC cycle whose sweep has dealt with this extent, or during which the
+	 * extent was created. While a sweep is running (`gSweepCycle` is not 0)
+	 * an extent with another tag has not been swept yet: nothing may be
+	 * allocated from it, and a free into it only clears the slot.
+	 */
+	size_t _sweepTag;
 
 	/**
 	 * When this is a slab, the second part of the Extent is made
@@ -237,6 +247,26 @@ private:
 	}
 
 public:
+	@property
+	ubyte sweepTag() const {
+		return cast(ubyte) _sweepTag;
+	}
+
+	@property
+	void sweepTag(ubyte tag) {
+		_sweepTag = tag;
+	}
+
+	/**
+	 * True while a sweep is running and has not visited this extent yet.
+	 * Must be called with the lock that serializes the sweep of this extent
+	 * held (the bin mutex for slabs).
+	 */
+	bool isUnswept() const {
+		auto c = (cast(shared) gSweepCycle).load();
+		return c != 0 && sweepTag != c;
+	}
+
 	Extent* at(void* ptr, uint npages, BlockDescriptor* block,
 	           ExtentClass extentClass) {
 		this = Extent(arenaIndex, ptr, npages, generation, block, extentClass);

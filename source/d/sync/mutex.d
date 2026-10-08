@@ -6,10 +6,28 @@ import symgc.thread;
 
 import symgc.intrinsics : likely;
 
+version(Symgc_phase_trace) {
+	// Thread local: how often this thread went through the slow path of a
+	// lock, and for how long (time unit is 100 ns).
+	ulong gLockSlowCount, gLockSlowTime;
+
+	extern(C) void symgc_lockstats(ulong* count, ulong* time) {
+		*count = gLockSlowCount;
+		*time = gLockSlowTime;
+	}
+}
+
 struct Mutex {
 private:
 	import d.sync.atomic;
 	Atomic!size_t word;
+
+	/**
+	 * The number of threads in `lockSlow`, spinning or parked. A hint for
+	 * background work that holds a lock in short bursts, so it can step aside
+	 * for a thread that is waiting (see `PageFiller.collect`).
+	 */
+	Atomic!uint contenders;
 
 	enum size_t LockBit = 0x01;
 	enum size_t QueueLockBit = 0x02;
@@ -42,6 +60,11 @@ public:
 
 	bool isHeld() nothrow {
 		return (cast(shared(Mutex)*) &this).isHeld();
+	}
+
+	@property
+	bool hasContenders() shared {
+		return contenders.load() != 0;
 	}
 
 	bool isHeld() shared nothrow {
@@ -93,6 +116,7 @@ public:
 	 */
 	void __clear() shared {
 		word.store(0);
+		contenders.store(0);
 	}
 
 	version(Windows) static shared(Waiter)* getWaiterAddress() {
@@ -217,6 +241,24 @@ private:
 	}
 
 	void lockSlow() shared {
+		contenders.fetchAdd(1);
+		scope(exit) contenders.fetchSub(1);
+
+		version(Symgc_phase_trace) {
+			import d.gc.time;
+			auto tL0 = getMonotonicTime();
+			scope(exit) {
+				auto dtL = getMonotonicTime() - tL0;
+				gLockSlowCount++;
+				gLockSlowTime += dtL;
+				if (dtL > 1500) { // 150 us
+					import core.stdc.stdio : fprintf, stderr;
+					import core.sys.posix.pthread : pthread_self;
+					fprintf(stderr, "slowlock %p %.0f us thread=%p\n", &this, dtL / 10.0, cast(void*) pthread_self());
+				}
+			}
+		}
+
 		// Trusting WTF::WordLock on that one...
 		enum SpinLimit = 40;
 		uint spinCount = 0;

@@ -449,6 +449,9 @@ final class SnazzyGC : GC
 		// clean up any lingering GC threads.
 		import d.gc.scanner;
 		cleanupGCThreads();
+
+		import d.gc.collector;
+		cleanupSweeper();
 	}
 }
 

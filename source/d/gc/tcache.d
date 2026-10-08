@@ -544,7 +544,22 @@ private:
 		}
 
 		// We are about to allocate, make room for it if needed.
-		if (maybeRunGCCycle()) {
+		version(Symgc_phase_trace) {
+			import d.gc.time;
+			auto tG0 = getMonotonicTime();
+		}
+
+		auto ranCycle = maybeRunGCCycle();
+
+		version(Symgc_phase_trace) {
+			auto dtG = getMonotonicTime() - tG0;
+			if (dtG > 3000) { // 300 us
+				import core.stdc.stdio : fprintf, stderr;
+				fprintf(stderr, "slowmaybegc ran=%d %.0f us\n", cast(int) ranCycle, dtG / 10.0);
+			}
+		}
+
+		if (ranCycle) {
 			// The bin might have gained a pointer through a
 			// finalizer.
 			if (bin.allocate(ptr)) {
@@ -554,6 +569,18 @@ private:
 
 		// The bin is empty, refill.
 		{
+			version(Symgc_phase_trace) {
+				import d.gc.time;
+				auto tR0 = getMonotonicTime();
+				scope(exit) {
+					auto dt = getMonotonicTime() - tR0;
+					if (dt > 5000) { // 500 us
+						import core.stdc.stdio : fprintf, stderr;
+						fprintf(stderr, "slowrefill class=%d %.0f us\n", cast(int) sizeClass, dt / 10.0);
+					}
+				}
+			}
+
 			state.enterBusyState();
 			scope(exit) state.exitBusyState();
 
@@ -822,6 +849,10 @@ private:
 
 		import d.gc.collector;
 		auto collector = Collector(&this);
+
+		// If a sweep is running and the heap is running away, help it.
+		collector.assistSweep();
+
 		return collector.maybeRunGCCycle();
 	}
 
