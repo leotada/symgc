@@ -87,6 +87,13 @@ public:
 		}
 
 		if (likely(emap.remap(e, ec))) {
+			// Pages may be recycled and hold anything. The verifier expects a
+			// slot to be either zero or poison, so start from zero.
+			version(Symgc_verify) {
+				import core.stdc.string : memset;
+				memset(e.address, 0, neededPages * PageSize);
+			}
+
 			return e;
 		}
 
@@ -848,6 +855,26 @@ private:
 		}
 	}
 
+	/**
+	 * Verifier mode (`-version=Symgc_verify`): fill every slot the sweep frees
+	 * with the poison byte, so a mutator that still reads a lost object sees
+	 * an impossible pointer, and `d.gc.verify.checkSlotOnAlloc` can tell
+	 * a write through a dangling pointer when the slot is handed out again.
+	 */
+	version(Symgc_verify) static
+	void poisonEvictedSlots(ulong evicted, int sizeClass, Extent* e, size_t nimbleIndex) {
+		import d.gc.slab;
+		import d.gc.verify;
+		auto slotSize = binInfos[sizeClass].slotSize;
+		void* nimbleBase = e.address + (nimbleIndex * 64 * slotSize);
+
+		while (evicted != 0) {
+			auto index = countTrailingZeros(evicted);
+			poisonSlot(nimbleBase + index * slotSize, slotSize);
+			evicted &= (evicted - 1);
+		}
+	}
+
 	static
 	void finalizeSlabNimble(ulong evicted, ulong metadataFlags, int sizeClass,
 	                        Extent* e, size_t nimbleIndex) {
@@ -934,6 +961,11 @@ private:
 					occupancyMask |= newOccupancy;
 					auto evicted = oldOccupancy ^ newOccupancy;
 					count += popCount(evicted);
+
+					// Declared first, so it runs after the occupancy update below.
+					version(Symgc_verify) {
+						scope(success) poisonEvictedSlots(evicted, sc, e, j);
+					}
 
 					scope(success) e.slabData.rawContent[j] = newOccupancy;
 
@@ -1046,6 +1078,10 @@ private:
 				// If completely empty and no metadata exists,
 				// we can short circuit here.
 				if (markBits == 0 && metadataFlags == 0) {
+					version(Symgc_verify) {
+						poisonEvictedSlots(e.slabData.rawContent[0], ec.sizeClass, e, 0);
+					}
+
 					deadExtents.insert(e);
 					continue;
 				}
@@ -1057,6 +1093,9 @@ private:
 
 				// Call any finalizers on dying slots.
 				finalizeSlabNimble(evicted, metadataFlags, sc, e, 0);
+				version(Symgc_verify) {
+					poisonEvictedSlots(evicted, sc, e, 0);
+				}
 
 				auto count = popCount(evicted);
 				stats.bytesCollected += count * binInfos[sc].slotSize;

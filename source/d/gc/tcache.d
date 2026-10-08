@@ -508,6 +508,11 @@ private:
 			return null;
 		}
 
+		version(Symgc_verify) {
+			import d.gc.verify;
+			checkSlotOnAlloc(ptr, size, slotSize);
+		}
+
 		import core.stdc.string : memset;
 		if (unlikely(zero)) {
 			memset(ptr, 0, slotSize);
@@ -581,6 +586,11 @@ private:
 		if (ShouldZeroFreeSlabs && pd.containsPointers) {
 			import core.stdc.string : memset;
 			memset(ptr, 0, slotSize);
+		}
+
+		version(Symgc_verify) {
+			import d.gc.verify;
+			poisonSlot(ptr, slotSize);
 		}
 
 		/**
