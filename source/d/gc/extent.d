@@ -95,10 +95,11 @@ struct ExtentClass {
 }
 
 /**
- * The GC cycle whose sweep is running, or 0 when no sweep is running.
+ * The epoch of the collection that is running (from the start of its mark to
+ * the end of its sweep), or 0 when none is. Each collection gets a new one.
  * Set while the world is stopped, cleared when every arena is swept.
  */
-shared Atomic!ubyte gSweepCycle;
+shared Atomic!uint gSweepCycle;
 
 /**
  * Set once anything with a finalizer was allocated. While it is clear, the
@@ -161,10 +162,18 @@ private:
 	GCMetadata _gcMetadata;
 
 	/**
-	 * The GC cycle whose sweep has dealt with this extent, or during which the
-	 * extent was created. While a sweep is running (`gSweepCycle` is not 0)
-	 * an extent with another tag has not been swept yet: nothing may be
-	 * allocated from it, and a free into it only clears the slot.
+	 * Low 32 bits: the epoch of the collection that has dealt with this extent
+	 * or in which the extent was created (see `gSweepCycle`). While a
+	 * collection is running, an extent with another tag has not been swept
+	 * yet: nothing may be allocated from it, a free into it only clears the
+	 * slot, and it has marks. An extent with the tag of the epoch was created
+	 * since the mark started, has no marks, and counts as live.
+	 *
+	 * The epoch is a counter that never repeats, not the 8 bit cycle of the
+	 * mark bits: a stale tag that matched would make the mark skip a live
+	 * object and free what is only reachable through it.
+	 *
+	 * Bit 40: a slot of this slab ever had a finalizer.
 	 */
 	size_t _sweepTag;
 
@@ -254,8 +263,8 @@ private:
 
 public:
 	@property
-	ubyte sweepTag() const {
-		return cast(ubyte) _sweepTag;
+	uint sweepTag() const {
+		return cast(uint) _sweepTag;
 	}
 
 	/**
@@ -264,8 +273,8 @@ public:
 	 * not visited yet, which nothing allocates from.
 	 */
 	@property
-	void sweepTag(ubyte tag) {
-		_sweepTag = (_sweepTag & ~size_t(0xff)) | tag;
+	void sweepTag(uint tag) {
+		_sweepTag = (_sweepTag & ~size_t(uint.max)) | tag;
 	}
 
 	/**
@@ -288,7 +297,7 @@ public:
 		}
 	}
 
-	private enum HasFinalizersBit = size_t(1) << 8;
+	private enum HasFinalizersBit = size_t(1) << 40;
 
 	/**
 	 * True while a sweep is running and has not visited this extent yet.

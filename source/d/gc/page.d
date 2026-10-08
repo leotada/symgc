@@ -130,8 +130,9 @@ private:
 	BlockDescriptor* sweepCurrent;
 	uint sweepPage;
 
-	// The cycle being swept, and what the sweep found so far.
+	// The cycle being swept, its epoch, and what the sweep found so far.
 	ubyte sweepGcCycle;
+	uint sweepEpoch;
 	CollectStats sweepStats;
 
 	// A step is running. See `sweepStep`.
@@ -665,8 +666,10 @@ private:
 		sparseBlocks.remove(block);
 
 		auto sweepSerial = block.sweepSerial;
+		auto bornEpoch = block.bornEpoch;
 		block.at(address + extraBlocks * BlockSize, false);
 		block.sweepSerial = sweepSerial;
+		block.bornEpoch = bornEpoch;
 		sparseBlocks.insert(block);
 
 		bool dirty;
@@ -855,9 +858,9 @@ private:
 
 		block.at(address, Dense);
 
-		// Created while a sweep runs: there is nothing in it to sweep, and
-		// it may not be in the extent map yet.
-		block.sweepSerial = gSweepCycle.load();
+		// Created while a collection runs: there is nothing in it to sweep,
+		// and it may not be in the extent map yet.
+		block.bornEpoch = gSweepCycle.load();
 
 		getAllBlocks(Dense).insert(block);
 		return block;
@@ -1097,6 +1100,8 @@ private:
 		assert(sweepPhase == SweepPhase.Idle, "A sweep is already running!");
 
 		sweepGcCycle = gcCycle;
+		sweepEpoch = gSweepCycle.load();
+		assert(sweepEpoch != 0, "No collection is running!");
 		sweepStats = CollectStats();
 
 		// The heap grows back to the collection target before the next
@@ -1111,12 +1116,12 @@ private:
 		import d.gc.extent : gAnyFinalizers;
 		if (gAnyFinalizers.load() == 0) {
 			sweepPhase = SweepPhase.DenseScan;
-			sweepNext = firstUnvisited(denseBlocks, gcCycle);
+			sweepNext = denseBlocks.first;
 			return;
 		}
 
 		sweepPhase = SweepPhase.DenseFinalize;
-		sweepNext = firstUnvisited(denseBlocks, finalizeSerialOf(gcCycle));
+		sweepNext = denseBlocks.first;
 	}
 
 	/**
@@ -1141,40 +1146,29 @@ private:
 	 * head, so a pass walks forward from the block that was first when it
 	 * started and ends when it meets a block it already visited.
 	 *
-	 * It starts at the first block that it has not visited: the first block that it has not visited. Blocks
-	 * created since the pass before are at the head of the ring, and are
-	 * tagged as visited, so they must be skipped, or the pass would end
-	 * before it started.
+	 * Blocks created since the collection started are skipped, and marked as
+	 * visited so that the walk still ends where it began: they have nothing to
+	 * sweep, and may not be in the extent map yet.
 	 */
-	BlockDescriptor* firstUnvisited(ref AllBlockRing ring, ushort serial) {
-		auto start = ring.first;
-		auto b = start;
-		while (b !is null) {
-			if (b.sweepSerial != serial) {
-				return b;
-			}
-
-			b = b.allNext;
-			if (b is start) {
-				break;
-			}
-		}
-
-		return null;
-	}
-
 	BlockDescriptor* nextSweepBlock(ushort serial) {
 		assert(mutex.isHeld(), "Mutex not held!");
 
-		auto b = sweepNext;
-		if (b is null || b.sweepSerial == serial) {
-			sweepNext = null;
-			return null;
-		}
+		while (true) {
+			auto b = sweepNext;
+			if (b is null || b.sweepSerial == serial) {
+				sweepNext = null;
+				return null;
+			}
 
-		b.sweepSerial = serial;
-		sweepNext = b.allNext;
-		return b;
+			b.sweepSerial = serial;
+			sweepNext = b.allNext;
+
+			if (b.bornEpoch == sweepEpoch) {
+				continue;
+			}
+
+			return b;
+		}
 	}
 
 	/**
@@ -1217,7 +1211,7 @@ private:
 
 					if (sweepCurrent is null) {
 						sweepPhase = SparseFinalize;
-						sweepNext = firstUnvisited(sparseBlocks, finalizeSerial);
+						sweepNext = sparseBlocks.first;
 						continue;
 					}
 
@@ -1235,7 +1229,7 @@ private:
 
 					if (sweepCurrent is null) {
 						sweepPhase = DenseScan;
-						sweepNext = firstUnvisited(denseBlocks, gcCycle);
+						sweepNext = denseBlocks.first;
 						continue;
 					}
 
@@ -1257,7 +1251,7 @@ private:
 						gSweepT[2] += getMonotonicTime() - tO0;
 
 						sweepPhase = DenseMinimize;
-						sweepNext = firstUnvisited(denseBlocks, minimizeSerial);
+						sweepNext = denseBlocks.first;
 						continue;
 					}
 
@@ -1272,7 +1266,7 @@ private:
 					auto b = nextSweepBlock(minimizeSerial);
 					if (b is null) {
 						sweepPhase = SparseScan;
-						sweepNext = firstUnvisited(sparseBlocks, gcCycle);
+						sweepNext = sparseBlocks.first;
 						continue;
 					}
 
@@ -1289,7 +1283,7 @@ private:
 
 					if (sweepCurrent is null) {
 						sweepPhase = SparseMinimize;
-						sweepNext = firstUnvisited(sparseBlocks, minimizeSerial);
+						sweepNext = sparseBlocks.first;
 						continue;
 					}
 
@@ -1311,7 +1305,8 @@ private:
 							foreach (ring; [&denseBlocks, &sparseBlocks]) {
 								for (auto r = ring.range; !r.empty; r.popFront()) {
 									auto s = r.front.sweepSerial;
-									assert(s == gcCycle || s == minimizeSerial,
+									assert(s == gcCycle || s == minimizeSerial
+										       || r.front.bornEpoch == sweepEpoch,
 									       "A block was not swept!");
 								}
 							}
@@ -1476,7 +1471,7 @@ private:
 
 		stats.bytesCollected += count * slotSize;
 		e.bits += count * Extent.FreeSlotsUnit;
-		e.sweepTag = gcCycle;
+		e.sweepTag = sweepEpoch;
 
 		// The slab is empty.
 		if (occupancy == 0) {
@@ -1533,7 +1528,7 @@ private:
 			i += e.npages;
 
 			// Created after the mark, or no slot ever had a finalizer.
-			if (e.sweepTag == gcCycle || !ec.supportsMetadata || !e.hasFinalizers) {
+			if (e.sweepTag == sweepEpoch || !ec.supportsMetadata || !e.hasFinalizers) {
 				continue;
 			}
 
@@ -1584,7 +1579,7 @@ private:
 
 			scope(success) i += npages;
 
-			if (e.sweepTag == gcCycle) {
+			if (e.sweepTag == sweepEpoch) {
 				continue;
 			}
 
@@ -1676,7 +1671,7 @@ private:
 				// Created after the mark: nothing to sweep. It is not counted
 				// in the stats either: they estimate what survived, which
 				// sets the next collection target.
-				if (e.sweepTag == gcCycle) {
+				if (e.sweepTag == sweepEpoch) {
 					continue;
 				}
 
@@ -1743,7 +1738,7 @@ private:
 				auto ec = pd.extentClass;
 
 				// Created after the mark: nothing to sweep, nor to count.
-				if (e.sweepTag == gcCycle) {
+				if (e.sweepTag == sweepEpoch) {
 					continue;
 				}
 

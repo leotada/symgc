@@ -17,6 +17,9 @@ struct CollectionInfo {
 	size_t stop;
 }
 
+// Only the thread that runs a cycle touches it, under the collector lock.
+__gshared uint gEpochCounter;
+
 /**
  * What the second half of a cycle (the sweep) needs from the first half.
  */
@@ -279,9 +282,15 @@ private:
 			}
 		}
 
-		// Extents created from now on are born after the mark.
+		// Extents created from now on are born after the mark. Each collection
+		// has an epoch of its own, which never repeats and is never 0.
 		import d.gc.extent;
-		gSweepCycle.store(gcCycle);
+		gEpochCounter++;
+		if (gEpochCounter == 0) {
+			gEpochCounter = 1;
+		}
+
+		gSweepCycle.store(gEpochCounter);
 
 		/**
 		 * The sweeper is paced unless the heap grows past 1/8 over the

@@ -90,15 +90,25 @@ private:
 
 	AllBlockRingNode allrnode;
 
+	// These small fields are together on purpose: the descriptor has to fit
+	// in 192 bytes for 21 of them to fit a page.
+
 	/**
-	 * The GC cycle whose sweep has visited this block, or in which the block
-	 * was created. Zero for a block no sweep has seen.
+	 * Which pass of the sweep visited this block last. Zero for a block no
+	 * sweep has seen.
 	 */
 	ushort _sweepSerial;
+	ubyte generation;
+
+	/**
+	 * The epoch of the collection in which the block was created, or 0. A
+	 * block created while a collection runs has nothing for the sweep to do,
+	 * and may not be in the extent map yet.
+	 */
+	uint _bornEpoch;
 
 	uint usedCount;
 	uint dirtyCount;
-	ubyte generation;
 
 	import d.gc.bitmap;
 	Bitmap!PagesInBlock allocatedPages;
@@ -168,6 +178,16 @@ public:
 	BlockDescriptor* allNext() {
 		auto n = allrnode.nextNode;
 		return n is &this ? null : n;
+	}
+
+	@property
+	uint bornEpoch() const {
+		return _bornEpoch;
+	}
+
+	@property
+	void bornEpoch(uint e) {
+		_bornEpoch = e;
 	}
 
 	@property

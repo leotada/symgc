@@ -428,6 +428,107 @@ public:
 		work.cleanup();
 	}
 
+	/**
+	 * One round of a concurrent mark, run by the GC thread while the program
+	 * runs: `seed` puts the roots of the round on the work list, and the
+	 * scanning threads and this one drain it. The caller is not a mutator and
+	 * has no stack to scan.
+	 */
+	void markRound(ubyte gcCycle, AddressRange managedSpace,
+	               scope void delegate(shared(Scanner)*) seed) shared {
+		this._managedAddressSpace = managedSpace;
+		this._gcCycle = gcCycle;
+
+		work.startGCScan();
+		seed(&this);
+		runMarkFromGCThread();
+		work.cleanup();
+	}
+
+	/**
+	 * The pages of a range of the scannable heap that the program wrote since
+	 * we last looked. We scan what a write can have changed: the part of each
+	 * slot on the page, if the slot is allocated and the mark found it live (or
+	 * it was born after the mark started, which has no mark and may point to
+	 * anything). Everything else is garbage, or not a pointer holder, and
+	 * scanning it only keeps its referents alive for one more cycle.
+	 */
+	void addDirtyRange(const(void)* start, size_t size) shared {
+		import d.gc.tcache;
+		auto emap = threadCache.emap;
+		auto cycle = _gcCycle;
+
+		import d.gc.extent : gSweepCycle;
+		auto epoch = gSweepCycle.load();
+
+		size_t end = cast(size_t) start + size;
+		for (size_t p = cast(size_t) start & ~(PageSize - 1); p < end; p += PageSize) {
+			auto pd = emap.lookup(cast(void*) p);
+			auto e = pd.extent;
+			if (e is null || !pd.containsPointers) {
+				continue;
+			}
+
+			auto born = e.sweepTag == epoch;
+			auto ec = pd.extentClass;
+
+			if (ec.isLarge()) {
+				if (!born && !e.isMarkedLarge(cycle)) {
+					continue;
+				}
+
+				size_t eaddr = cast(size_t) e.address;
+				auto lo = max(p, eaddr);
+				auto hi = min(p + PageSize, eaddr + e.size);
+				if (lo < hi) {
+					addToWorkList(makeRange(cast(void*) lo, cast(void*) hi));
+				}
+
+				continue;
+			}
+
+			// A slab, dense or sparse: find the slots that overlap the page.
+			auto bi = binInfos[ec.sizeClass];
+			size_t slabBase = p - pd.index * PageSize;
+			size_t slotSize = bi.slotSize;
+
+			auto first = (p - slabBase) / slotSize;
+			auto last = min((p + PageSize - 1 - slabBase) / slotSize, bi.nslots - 1);
+
+			ulong sparseMarks = 0;
+			const(ulong)* denseMarks = null;
+			if (!born) {
+				if (ec.dense) {
+					denseMarks = e.getMarksDense();
+				} else {
+					sparseMarks = e.getMarksSparse(cycle);
+				}
+			}
+
+			foreach (index; first .. last + 1) {
+				if (!e.slabData.valueAt(cast(uint) index)) {
+					continue;
+				}
+
+				if (!born) {
+					auto marked = ec.dense
+						? ((denseMarks[index / 64] >> (index % 64)) & 1) != 0
+						: ((sparseMarks >> index) & 1) != 0;
+					if (!marked) {
+						continue;
+					}
+				}
+
+				size_t slot = slabBase + index * slotSize;
+				auto lo = max(p, slot);
+				auto hi = min(p + PageSize, slot + slotSize);
+				if (lo < hi) {
+					addToWorkList(makeRange(cast(void*) lo, cast(void*) hi));
+				}
+			}
+		}
+	}
+
 	void addToWorkList(WorkItem item) shared {
 		work.addToWorkList((&item)[0 .. 1]);
 	}
@@ -463,6 +564,14 @@ private:
 	}
 
 	void runMarkFromScanThread() shared {
+		runMarkImpl!false();
+	}
+
+	/**
+	 * The GC thread that runs a concurrent cycle works like the main thread,
+	 * but its own stack and TLS are not the program's: it has none to scan.
+	 */
+	void runMarkFromGCThread() shared {
 		runMarkImpl!false();
 	}
 
@@ -543,6 +652,9 @@ private:
 	AddressRange managedAddressSpace;
 	ubyte gcCycle;
 
+	// The epoch of the collection, see `Extent._sweepTag`.
+	uint epoch;
+
 	LastDenseSlabCache ldsCache;
 
 public:
@@ -557,6 +669,9 @@ public:
 		// set up the scan parameters for this batch of scanning.
 		this.managedAddressSpace = scanner.managedAddressSpace;
 		this.gcCycle = scanner.gcCycle;
+
+		import d.gc.extent : gSweepCycle;
+		this.epoch = gSweepCycle.load();
 	}
 
 	void scan(const(void*)[] range) {
@@ -613,6 +728,12 @@ public:
 					assert(pd.extent !is null);
 					assert(pd.extent.contains(ptr));
 
+					// Created since the mark started (a concurrent mark):
+					// it has no marks, and counts as live.
+					if (pd.extent.sweepTag == epoch) {
+						continue;
+					}
+
 					if (!markDense(pd, index)) {
 						continue;
 					}
@@ -646,6 +767,11 @@ public:
 				auto e = pd.extent;
 				if (e is null) {
 					// We have no mapping here, move on.
+					continue;
+				}
+
+				// Created since the mark started: live, nothing to mark.
+				if (e.sweepTag == epoch) {
 					continue;
 				}
 

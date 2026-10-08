@@ -149,12 +149,14 @@ bool suspendDruntimeThreads(bool alwaysSignal, ref uint suspended) {
 }
 
 void scanWorldPausedData(ScanDg scan) {
-	// scan all data that is NOT part of our thread's current stack.
-	auto myStackBottom = Thread.getThis().m_curr.bstack;
+	// scan all data that is NOT part of our thread's current stack. A GC
+	// thread that is not a druntime thread has none.
+	auto self = Thread.getThis();
+	auto myStackBottom = self is null ? null : self.m_curr.bstack;
 	void scanItem(ScanType type, void* pbot, void* ptop) nothrow {
 		import d.gc.range;
 		auto r = makeRange(pbot, ptop);
-		if (type == ScanType.stack && myStackBottom >= r.ptr &&
+		if (type == ScanType.stack && myStackBottom !is null && myStackBottom >= r.ptr &&
 				myStackBottom <= r.ptr + r.length)
 			// my stack range, no need to scan right now, this will be scanned later
 			return;
