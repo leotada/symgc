@@ -2,6 +2,7 @@ module d.gc.collector;
 
 import d.gc.arena;
 import d.gc.emap;
+import d.gc.range;
 import d.gc.spec;
 import d.gc.tcache;
 import d.gc.time;
@@ -80,11 +81,15 @@ private:
 		import d.gc.range;
 		auto managedAddressSpace = dataRange.merge(ptrRange);
 
-		prepareGCCycle();
+		// Start pause: prepare the arenas and turn the SATB log on.
+		cycleStart(managedAddressSpace);
 		auto tPrepared = getMonotonicTime();
 
 		// Go on and on until all worklists are empty.
 		markGC(gcCycle, managedAddressSpace);
+
+		// Remark pause: nothing is queued yet, because the world is still stopped.
+		cycleRemark();
 		auto tMarked = getMonotonicTime();
 
 		version(Symgc_druntime_hooks) {
@@ -142,6 +147,30 @@ private:
 
 		info.stop = getMonotonicTime();
 		return info;
+	}
+
+	/**
+	 * The cycle is split in a start pause, the mark, and a remark pause. For
+	 * now all three run with the world stopped, which must behave exactly as
+	 * before: mutators cannot log anything, so the SATB queue stays empty.
+	 * Making the mark concurrent moves the restart between the first two.
+	 */
+	void cycleStart(AddressRange managedAddressSpace) {
+		import d.gc.satb;
+		assert(!satbMarking(), "Marking flag already set!");
+
+		prepareGCCycle();
+
+		auto lo = managedAddressSpace.ptr;
+		satbBegin(lo, lo + managedAddressSpace.size);
+	}
+
+	void cycleRemark() {
+		import d.gc.satb;
+		satbFlushThread();
+		auto n = satbDrain((void*) { assert(false, "Pointer logged while the world was stopped!"); });
+		assert(n == 0);
+		satbEnd();
 	}
 
 	void prepareGCCycle() {

@@ -101,6 +101,11 @@ public:
 		return cast(void*) -base;
 	}
 
+	@property
+	size_t size() const {
+		return length;
+	}
+
 	this(const void* ptr, size_t size) {
 		base = -(cast(ptrdiff_t) ptr);
 		length = size;
