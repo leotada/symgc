@@ -41,6 +41,7 @@ shared(RegionAllocator)* gPointerRegionAllocator() {
 
 	if (unlikely(regionAllocator.base is null)) {
 		regionAllocator.base = &gBase;
+		regionAllocator.trackDirty = true;
 	}
 
 	return &regionAllocator;
@@ -51,6 +52,10 @@ enum MinimumBlockCollectThreshold = 8;
 struct RegionAllocator {
 private:
 	package shared(Base)* base;
+
+	// Whether the memory we map holds pointers, and the writes to it have to
+	// be tracked for a concurrent mark.
+	package bool trackDirty;
 
 	import d.sync.mutex;
 	Mutex mutex;
@@ -262,6 +267,12 @@ private:
 
 		auto range = AddressRange(ptr, ptr + blocks * BlockSize);
 		addressRange = addressRange.merge(range);
+
+		// Memory that holds pointers is tracked for a concurrent mark.
+		if (trackDirty) {
+			import d.gc.dirty;
+			dirtyRegister(ptr, size);
+		}
 
 		// Newly allocated blocks are considered clean.
 		assert(blocks <= uint.max, "blocks does not fit in 32 bits!");

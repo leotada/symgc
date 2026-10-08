@@ -3,6 +3,9 @@ module d.gc.collector;
 import d.gc.arena;
 import d.gc.emap;
 import d.gc.range;
+import d.gc.hooks : __sd_gc_global_scan;
+import d.gc.scanner : Scanner;
+import d.gc.types : ScanDg;
 import d.gc.spec;
 import d.gc.tcache;
 import d.gc.time;
@@ -28,8 +31,64 @@ struct CycleContext {
 	size_t threadCount;
 	CollectionInfo info;
 
+	// The mark is concurrent: the GC thread does the whole cycle.
+	bool concurrent;
+
+	// The kernel stopped tracking writes and the remark marked everything again.
+	bool fellBack;
+
 	// Only used by the phase trace.
 	ulong pauseStartTime, tStopped, tPrepared, tMarked, tFlushed;
+	ulong startPause, remarkPause, concurrentMark;
+	ulong[4] remarkParts; // stop, dirty pages, mark, restart
+	ulong scanBytesBeforeRemark, scanBytesRemark;
+	uint rounds;
+	size_t lastRoundPages, remarkPages;
+}
+
+/**
+ * Ranges of the heap the program wrote, to scan again.
+ */
+struct DirtyList {
+	struct Range {
+		const(void)* start;
+		size_t size;
+	}
+
+	Range* ptr;
+	size_t length;
+	size_t capacity;
+
+	void clear() {
+		length = 0;
+	}
+
+	void add(const(void)* start, size_t size) {
+		if (length == capacity) {
+			import core.stdc.stdlib : realloc;
+			auto newCapacity = capacity == 0 ? 1024 : capacity * 2;
+			auto p = cast(Range*) realloc(ptr, newCapacity * Range.sizeof);
+			assert(p !is null, "Out of memory listing the dirty ranges!");
+
+			ptr = p;
+			capacity = newCapacity;
+		}
+
+		ptr[length++] = Range(start, size);
+	}
+
+	void seed(shared(Scanner)* scanner) {
+		foreach (r; ptr[0 .. length]) {
+			scanner.addDirtyRange(r.start, r.size);
+		}
+	}
+
+	void free() {
+		import core.stdc.stdlib : free;
+		free(ptr);
+		ptr = null;
+		length = capacity = 0;
+	}
 }
 
 struct Collector {
@@ -57,10 +116,27 @@ struct Collector {
 	 * mutators, not to let them run away.
 	 */
 	void assistSweep() {
-		import d.gc.extent : gSweepCycle;
+		import d.gc.extent : gSweepCycle, gMarkActive;
 		import d.gc.page : gSweepHardLimit, AssistResult;
 
 		if (gSweepCycle.load() == 0 || Arena.computeUsedPageCount() <= gSweepHardLimit) {
+			return;
+		}
+
+		/**
+		 * The mark runs beside the program, and a program that allocates
+		 * faster than the mark traces makes the remark pause scan all of
+		 * it (measured: 5.7 GiB, 5.4 s, with four threads allocating
+		 * garbage flat out). It cannot help the mark, so it waits for it.
+		 * Waiting is not a hazard to the pause: a thread asleep here is not
+		 * busy, and is stopped like any other.
+		 */
+		if (gMarkActive.load() != 0) {
+			import core.sys.posix.unistd : usleep;
+			while (gMarkActive.load() != 0 && Arena.computeUsedPageCount() > gSweepHardLimit) {
+				usleep(100);
+			}
+
 			return;
 		}
 
@@ -122,6 +198,20 @@ private:
 		// Make sure we do not try to collect during a collection.
 		auto oldGCActivationState = threadCache.activateGC(false);
 		scope(exit) threadCache.activateGC(oldGCActivationState);
+
+		/**
+		 * With a concurrent mark, the thread that triggered the collection
+		 * does not do any of it: the GC thread does, and the program only
+		 * stops for the two short pauses.
+		 */
+		if (allowAsync && concurrentMarkWanted()) {
+			ctx.concurrent = true;
+			if (gSweeper.submit(ctx)) {
+				return true;
+			}
+
+			ctx.concurrent = false;
+		}
 
 		import d.gc.global;
 		auto gcCycle = gState.nextGCCycle();
@@ -213,6 +303,242 @@ private:
 	}
 
 	/**
+	 * A cycle with a mostly-concurrent mark (Boehm, Demers and Shenker, 1991),
+	 * run by the GC thread while the program runs. Only the two pauses stop it.
+	 *
+	 *  1. Arm the dirty page tracker. The program runs.
+	 *  2. Start pause: prepare the mark bits, empty the bins, start the epoch.
+	 *     Short: it does not scan anything.
+	 *  3. Mark from the global roots, with the program running. Then, in
+	 *     rounds, scan again what the program wrote meanwhile, until little is
+	 *     left. Stacks and thread local storage are not scanned yet.
+	 *  4. Remark pause: scan the roots, the stacks and the thread local
+	 *     storage, and what the program wrote since the last round.
+	 *
+	 * Everything reachable when the world stops in 4 is marked: marks only
+	 * ever get added, a pointer stored into an object that was already
+	 * scanned dirties its page, and the stacks and roots are scanned last,
+	 * while nothing can move a pointer. What was reachable earlier and is
+	 * not anymore may stay marked (floating garbage, freed by the next cycle).
+	 * Objects created since step 2 are not marked: they count as live and
+	 * the mark does not look at them (see `Extent._sweepTag`), while the pages
+	 * they are written to are scanned like any other.
+	 *
+	 * The program cannot free a large extent while the mark runs (see
+	 * `gMarkActive`), and cannot free a slab at all until the sweep.
+	 */
+	void runConcurrentMark(ref CycleContext ctx) {
+		import d.gc.dirty;
+		import d.gc.extent;
+		import d.gc.global;
+		import d.gc.page : gSweepHardLimit;
+		import d.gc.range;
+		import d.gc.region;
+		import d.gc.scanner;
+		import d.gc.thread;
+
+		assert(!threadCache.state.busy, "Cannot run GC cycle while busy!");
+
+		auto gcCycle = gState.nextGCCycle();
+		ctx.gcCycle = gcCycle;
+
+		/**
+		 * The mark shares the machine with the program, so it gets a few
+		 * cores, not all of them: a quarter, between 2 and 6. The threads
+		 * stay, so an explicit collection later uses the same.
+		 * SYMGC_MARK_THREADS overrides, and so does setScanningThreads.
+		 */
+		auto threadCount = gCollectorState.scanningThreads;
+		if (threadCount == 0) {
+			import core.stdc.stdlib : getenv, atoi;
+			auto env = getenv("SYMGC_MARK_THREADS");
+			if (env !is null && atoi(env) > 0) {
+				threadCount = atoi(env);
+			} else {
+				import d.gc.cpu;
+				auto cores = getCoreCount();
+				threadCount = cores / 4;
+				threadCount = threadCount < 2 ? 2 : (threadCount > 6 ? 6 : threadCount);
+				if (threadCount > cores) {
+					threadCount = cores;
+				}
+			}
+		}
+
+		ctx.threadCount = threadCount;
+		startGCThreads(threadCount - 1);
+
+		// 1. Arm, with the program running.
+		dirtyArm();
+
+		// 2. The start pause.
+		ctx.pauseStartTime = getMonotonicTime();
+		stopTheWorld();
+		ctx.tStopped = getMonotonicTime();
+
+		auto dataRange = gDataRegionAllocator.computeAddressRange();
+		auto ptrRange = gPointerRegionAllocator.computeAddressRange();
+		auto space = dataRange.merge(ptrRange);
+
+		cycleStart(space, gcCycle, false);
+		gMarkActive.store(1);
+		ctx.tPrepared = getMonotonicTime();
+
+		/**
+		 * Put the roots, the stacks and the thread local storage on the work
+		 * list now: the stacks are only valid while the world is stopped, and
+		 * most of a D program hangs off its thread locals. This only lists
+		 * the ranges. They are read, and traced, after the world restarts, so
+		 * they may have changed by then: the remark pause scans them again.
+		 */
+		markBeginGC(gcCycle, space);
+		markSeedGC((shared(Scanner)* s) {
+			__sd_gc_global_scan(cast(ScanDg) &s.processGlobal);
+		});
+
+		restartTheWorld();
+		clearWorldProbation();
+		ctx.startPause = getMonotonicTime() - ctx.pauseStartTime;
+
+		// 3. The mark, with the program running.
+		auto tMark0 = getMonotonicTime();
+		markEndGC();
+
+		DirtyList list;
+		scope(exit) list.free();
+
+		enum MaxRounds = 8;
+		enum RemarkPages = 2048; // 8 MiB
+
+		uint rounds = 0;
+		size_t lastPages = 0;
+		foreach (i; 0 .. MaxRounds) {
+			list.clear();
+			lastPages = dirtyCollect((const(void)* start, size_t size) {
+				list.add(start, size);
+			});
+
+			rounds++;
+
+			// Tracking failed: the remark will mark again from scratch.
+			if (!dirtyAvailable()) {
+				break;
+			}
+
+			if (lastPages <= RemarkPages) {
+				// What is left is little: the remark pause will do it.
+				// Put it back for the pause to find.
+				markRoundGC(gcCycle, space, (shared(Scanner)* s) {
+					list.seed(s);
+				});
+				break;
+			}
+
+			markRoundGC(gcCycle, space, (shared(Scanner)* s) {
+				list.seed(s);
+			});
+		}
+
+		ctx.concurrentMark = getMonotonicTime() - tMark0;
+		ctx.rounds = rounds;
+		ctx.lastRoundPages = lastPages;
+
+		// 4. The remark pause.
+		auto tRemark0 = getMonotonicTime();
+		stopTheWorld();
+		auto tR1 = getMonotonicTime();
+
+		list.clear();
+		auto remarkPages = dirtyCollect((const(void)* start, size_t size) {
+			list.add(start, size);
+		});
+		auto tR2 = getMonotonicTime();
+
+		version(Symgc_phase_trace) {
+			import d.gc.scanner : gScanBytes;
+			ctx.scanBytesBeforeRemark = gScanBytes;
+		}
+
+		/**
+		 * If the kernel stopped tracking at some point (a mapping it could
+		 * not register, an error), the pages we were told about are not all
+		 * of them, and the mark above cannot be trusted. Mark again, from
+		 * scratch, with the world stopped: new mark bits, and a cycle number
+		 * of its own so that the sparse and large marks of the first try do
+		 * not count.
+		 */
+		bool tracked = dirtyAvailable();
+		version(Symgc_verify) {
+			import core.stdc.stdlib : getenv;
+			auto fail = getenv("SYMGC_DIRTY_FAIL");
+			if (fail !is null && fail[0] == '1') {
+				tracked = false;
+			}
+		}
+
+		if (!tracked) {
+			gcCycle = gState.nextGCCycle();
+			ctx.gcCycle = gcCycle;
+			ctx.fellBack = true;
+
+			/**
+			 * A new epoch, so the extents born since the mark started are
+			 * ordinary ones now: the new mark bits cover them, the mark
+			 * traces them (it skipped them before, relying on the pages we
+			 * can no longer trust), and the sweep sweeps them. Slabs that
+			 * the program got from the bins meanwhile are unswept for the
+			 * new epoch, so the bins must be empty again.
+			 */
+			clearBins();
+			startEpoch();
+
+			prepareGCCycle();
+			markRoundGC(gcCycle, space, (shared(Scanner)* s) {
+				__sd_gc_global_scan(cast(ScanDg) &s.processGlobal);
+			});
+		} else {
+			markRoundGC(gcCycle, space, (shared(Scanner)* s) {
+				// The roots, the stacks, the thread local storage...
+				__sd_gc_global_scan(cast(ScanDg) &s.processGlobal);
+
+				// ...and what the program wrote since the last round.
+				list.seed(s);
+			});
+		}
+
+		auto tR3 = getMonotonicTime();
+		version(Symgc_phase_trace) {
+			import d.gc.scanner : gScanBytes;
+			ctx.scanBytesRemark = gScanBytes - ctx.scanBytesBeforeRemark;
+		}
+
+		gMarkActive.store(0);
+
+		version(Symgc_druntime_hooks) {
+			import core.thread.symthread;
+			ctx.info.freeBytes = getTotalCachedAllocations();
+		}
+
+		restartTheWorld();
+		clearWorldProbation();
+		auto tR4 = getMonotonicTime();
+		ctx.remarkParts = [tR1 - tRemark0, tR2 - tR1, tR3 - tR2, tR4 - tR3];
+
+		/**
+		 * This thread is not scanned, so what its thread cache holds (the
+		 * memory of the mark's work list, for one) looks dead to the sweep,
+		 * which would free it under the cache. Give it back before.
+		 */
+		threadCache.flush();
+
+		ctx.remarkPause = getMonotonicTime() - tRemark0;
+		ctx.remarkPages = remarkPages;
+		ctx.info.pauseTime = ctx.startPause + ctx.remarkPause;
+		ctx.tMarked = getMonotonicTime();
+		ctx.tFlushed = ctx.tMarked;
+	}
+
+	/**
 	 * The part of the cycle that runs after the world restarted: the sweep
 	 * and the bookkeeping. It runs on the sweeper thread when there is one.
 	 */
@@ -233,6 +559,19 @@ private:
 				(ctx.tPrepared - ctx.tStopped) / us, (ctx.tMarked - ctx.tPrepared) / us,
 				(ctx.pauseStartTime + ctx.info.pauseTime - ctx.tMarked) / us,
 				(tSwept - ctx.tFlushed) / us, (tSwept - ctx.info.start) / us);
+			if (ctx.concurrent) {
+				fprintf(stderr, "gcconc startpause=%.0f remarkpause=%.0f concurrent_mark=%.0f rounds=%u last_round_pages=%zu remark_pages=%zu us\n",
+					ctx.startPause / us, ctx.remarkPause / us, ctx.concurrentMark / us,
+					ctx.rounds, ctx.lastRoundPages, ctx.remarkPages);
+				if (ctx.fellBack) {
+					fprintf(stderr, "gcfallback: dirty tracking failed, the remark marked everything again\n");
+				}
+
+				fprintf(stderr, "gcremark stop=%.0f dirty=%.0f mark=%.0f restart=%.0f us, scanned in the remark %.1f MiB, before it %.1f MiB\n",
+					ctx.remarkParts[0] / us, ctx.remarkParts[1] / us, ctx.remarkParts[2] / us, ctx.remarkParts[3] / us,
+					ctx.scanBytesRemark / 1048576.0, ctx.scanBytesBeforeRemark / 1048576.0);
+			}
+
 			import d.gc.page : gSweepT, gSweepHardLimit;
 			fprintf(stderr, "gcheap hardLimit=%zu pages, used now=%zu pages, survivors=%zu pages\n",
 				cast(size_t) gSweepHardLimit, Arena.computeUsedPageCount(), cast(size_t) pageCollectStats.pagesCommitted);
@@ -263,34 +602,14 @@ private:
 	 * before: mutators cannot log anything, so the SATB queue stays empty.
 	 * Making the mark concurrent moves the restart between the first two.
 	 */
-	void cycleStart(AddressRange managedAddressSpace, ubyte gcCycle) {
+	void cycleStart(AddressRange managedAddressSpace, ubyte gcCycle, bool satb = true) {
 		import d.gc.satb;
 		assert(!satbMarking(), "Marking flag already set!");
 
 		prepareGCCycle();
 
-		/**
-		 * Empty the bins while the world is stopped. From now on a slab can
-		 * only be allocated from once the sweep has visited it and put it
-		 * back, so threads can allocate during the sweep.
-		 */
-		foreach (i; 0 .. ArenaCount) {
-			import d.gc.arena;
-			auto a = Arena.getIfInitialized(i);
-			if (a !is null) {
-				a.clearBinsForCollection();
-			}
-		}
-
-		// Extents created from now on are born after the mark. Each collection
-		// has an epoch of its own, which never repeats and is never 0.
-		import d.gc.extent;
-		gEpochCounter++;
-		if (gEpochCounter == 0) {
-			gEpochCounter = 1;
-		}
-
-		gSweepCycle.store(gEpochCounter);
+		clearBins();
+		startEpoch();
 
 		/**
 		 * The sweeper is paced unless the heap grows past 1/8 over the
@@ -314,8 +633,41 @@ private:
 		import d.gc.page : gSweepRetainPages;
 		gSweepRetainPages = target;
 
-		auto lo = managedAddressSpace.ptr;
-		satbBegin(lo, lo + managedAddressSpace.size);
+		// The SATB log is for a mark that stops the world; the concurrent
+		// mark tracks the pages the program writes instead.
+		if (satb) {
+			auto lo = managedAddressSpace.ptr;
+			satbBegin(lo, lo + managedAddressSpace.size);
+		}
+	}
+
+	/**
+	 * Empty the bins while the world is stopped. From now on a slab can only
+	 * be allocated from once the sweep has visited it and put it back, so
+	 * threads can allocate during the mark and the sweep.
+	 */
+	void clearBins() {
+		foreach (i; 0 .. ArenaCount) {
+			import d.gc.arena;
+			auto a = Arena.getIfInitialized(i);
+			if (a !is null) {
+				a.clearBinsForCollection();
+			}
+		}
+	}
+
+	/**
+	 * Extents created from now on are born after the mark. Each collection
+	 * has an epoch of its own, which never repeats and is never 0.
+	 */
+	void startEpoch() {
+		import d.gc.extent;
+		gEpochCounter++;
+		if (gEpochCounter == 0) {
+			gEpochCounter = 1;
+		}
+
+		gSweepCycle.store(gEpochCounter);
 	}
 
 	void cycleRemark() {
@@ -349,6 +701,22 @@ private:
 			}
 		}
 		return stats;
+	}
+}
+
+/**
+ * Does the mark run beside the program? It needs the kernel to track the
+ * pages the program writes (SYMGC_CONCURRENT_MARK=1, Linux 6.7 or later), and
+ * the GC thread that runs it.
+ */
+bool concurrentMarkWanted() {
+	version(Windows) {
+		return false;
+	} else version(Symgc_sync_sweep) {
+		return false;
+	} else {
+		import d.gc.dirty;
+		return dirtyAvailable();
 	}
 }
 
@@ -578,6 +946,11 @@ private:
 
 			import d.gc.tcache;
 			auto collector = Collector(&threadCache);
+			if (c.concurrent) {
+				c.info.start = getMonotonicTime();
+				collector.runConcurrentMark(c);
+			}
+
 			collector.finishCycle(c);
 
 			/**

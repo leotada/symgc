@@ -160,6 +160,9 @@ struct DirtyTracker {
 	bool tried;
 	bool available;
 
+	// For the unit test: track even if the environment did not ask.
+	bool forced;
+
 	int uffd = -1;
 	int pagemap = -1;
 
@@ -208,8 +211,14 @@ bool initImpl(DirtyTracker* t) {
 
 	t.tried = true;
 
-	// The environment can turn it off: SYMGC_DIRTY=0.
+	// Only when asked for, for now: SYMGC_CONCURRENT_MARK=1. SYMGC_DIRTY=0
+	// turns the tracking off even then.
 	import core.stdc.stdlib : getenv;
+	auto want = getenv("SYMGC_CONCURRENT_MARK");
+	if (!t.forced && (want is null || want[0] != '1')) {
+		return false;
+	}
+
 	auto env = getenv("SYMGC_DIRTY");
 	if (env !is null && env[0] == '0') {
 		return false;
@@ -312,6 +321,17 @@ size_t collectImpl(DirtyTracker* t, scope DirtyRangeDg dg) {
 		return 0;
 	}
 
+	// A planted bug for the tests (SYMGC_DIRTY_SKIP=1): report nothing, so
+	// the mark never rescans what the program wrote. The mark race stress
+	// must fail with it, or it is not testing anything.
+	version(Symgc_verify) {
+		import core.stdc.stdlib : getenv;
+		auto skip = getenv("SYMGC_DIRTY_SKIP");
+		if (skip !is null && skip[0] == '1' && dg !is null) {
+			dg = null;
+		}
+	}
+
 	enum Cap = 2048;
 	page_region[Cap] vec;
 	size_t pages = 0;
@@ -362,6 +382,16 @@ size_t collectImpl(DirtyTracker* t, scope DirtyRangeDg dg) {
 
 @"dirty tracking" unittest {
 	import core.sys.posix.sys.mman;
+
+	// Nothing was registered if nobody asked for tracking, so this is safe.
+	gDirty.mutex.lock();
+	auto t = cast(DirtyTracker*) &gDirty;
+	if (!t.available) {
+		t.forced = true;
+		t.tried = false;
+	}
+
+	gDirty.mutex.unlock();
 
 	if (!dirtyAvailable()) {
 		// An old kernel, or a restricted container: nothing to test here.

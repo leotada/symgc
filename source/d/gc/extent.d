@@ -102,6 +102,14 @@ struct ExtentClass {
 shared Atomic!uint gSweepCycle;
 
 /**
+ * Set while a concurrent mark runs, with the program. The marker looks at
+ * extents that the program could free and reuse under it, so large extents
+ * are not freed or resized in place meanwhile (slabs cannot be freed: the
+ * sweep owns them, see `Extent.isUnswept`).
+ */
+shared Atomic!ubyte gMarkActive;
+
+/**
  * Set once anything with a finalizer was allocated. While it is clear, the
  * sweep skips its pass for finalizers.
  */

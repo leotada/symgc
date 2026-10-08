@@ -22,6 +22,31 @@ void markGC(ubyte gcCycle, AddressRange managedSpace) {
 	gScanner.mark(gcCycle, managedSpace);
 }
 
+/**
+ * One round of the concurrent mark, see `Scanner.markRound`.
+ */
+void markRoundGC(ubyte gcCycle, AddressRange managedSpace,
+                 scope void delegate(shared(Scanner)*) seed) {
+	gScanner.markRound(gcCycle, managedSpace, seed);
+}
+
+// Bytes handed to the scanner, a counter for the phase trace.
+version(Symgc_phase_trace) {
+	shared ulong gScanBytes;
+}
+
+void markBeginGC(ubyte gcCycle, AddressRange managedSpace) {
+	gScanner.markBegin(gcCycle, managedSpace);
+}
+
+void markSeedGC(scope void delegate(shared(Scanner)*) seed) {
+	seed(&gScanner);
+}
+
+void markEndGC() {
+	gScanner.markEnd();
+}
+
 private:
 struct ScanningList {
 	@disable this(this);
@@ -332,7 +357,7 @@ struct ScanningList {
 	}
 }
 
-struct Scanner {
+package struct Scanner {
 private:
 	ScanningList work;
 
@@ -436,11 +461,25 @@ public:
 	 */
 	void markRound(ubyte gcCycle, AddressRange managedSpace,
 	               scope void delegate(shared(Scanner)*) seed) shared {
+		markBegin(gcCycle, managedSpace);
+		seed(&this);
+		markEnd();
+	}
+
+	/**
+	 * A round in two parts, for the start pause: begin, seed with the world
+	 * stopped (the threads' stacks are only valid then), restart the world,
+	 * and drain with the program running. The scanning threads start on the
+	 * work as soon as there is some.
+	 */
+	void markBegin(ubyte gcCycle, AddressRange managedSpace) shared {
 		this._managedAddressSpace = managedSpace;
 		this._gcCycle = gcCycle;
 
 		work.startGCScan();
-		seed(&this);
+	}
+
+	void markEnd() shared {
 		runMarkFromGCThread();
 		work.cleanup();
 	}
@@ -460,6 +499,33 @@ public:
 
 		import d.gc.extent : gSweepCycle;
 		auto epoch = gSweepCycle.load();
+
+		/**
+		 * Neighbouring slots are one run: a page of small slots would
+		 * otherwise be hundreds of work items, each taking the lock of the
+		 * work list (measured: 1.4 s for 28 MiB of dirty pages).
+		 */
+		size_t runLo = 0;
+		size_t runHi = 0;
+
+		void flush() {
+			if (runLo < runHi) {
+				addToWorkList(makeRange(cast(void*) runLo, cast(void*) runHi));
+			}
+
+			runLo = runHi = 0;
+		}
+
+		void emit(size_t lo, size_t hi) {
+			if (lo != runHi) {
+				flush();
+				runLo = lo;
+			}
+
+			runHi = hi;
+		}
+
+		scope(exit) flush();
 
 		size_t end = cast(size_t) start + size;
 		for (size_t p = cast(size_t) start & ~(PageSize - 1); p < end; p += PageSize) {
@@ -481,7 +547,7 @@ public:
 				auto lo = max(p, eaddr);
 				auto hi = min(p + PageSize, eaddr + e.size);
 				if (lo < hi) {
-					addToWorkList(makeRange(cast(void*) lo, cast(void*) hi));
+					emit(lo, hi);
 				}
 
 				continue;
@@ -523,7 +589,7 @@ public:
 				auto lo = max(p, slot);
 				auto hi = min(p + PageSize, slot + slotSize);
 				if (lo < hi) {
-					addToWorkList(makeRange(cast(void*) lo, cast(void*) hi));
+					emit(lo, hi);
 				}
 			}
 		}
@@ -681,6 +747,11 @@ public:
 	}
 
 	void scan(WorkItem item) {
+		version(Symgc_phase_trace) {
+			import core.atomic : atomicOp;
+			atomicOp!"+="(gScanBytes, item.length);
+		}
+
 		scanImpl!true(item, ldsCache);
 	}
 

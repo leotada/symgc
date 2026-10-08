@@ -196,6 +196,11 @@ public:
 	}
 
 	bool growLarge(ref CachedExtentMap emap, Extent* e, uint pages) shared {
+		// A concurrent mark may be looking at it: the caller copies instead.
+		if (unlikely(gMarkActive.load() != 0)) {
+			return false;
+		}
+
 		assert(e !is null, "Extent is null!");
 		assert(e.isLarge(), "Expected a large extent!");
 		assert(e.arenaIndex == index, "Invalid arena index!");
@@ -205,6 +210,11 @@ public:
 	}
 
 	bool shrinkLarge(ref CachedExtentMap emap, Extent* e, uint pages) shared {
+		// A concurrent mark may be looking at it: the caller copies instead.
+		if (unlikely(gMarkActive.load() != 0)) {
+			return false;
+		}
+
 		assert(e !is null, "Extent is null!");
 		assert(e.isLarge(), "Expected a large extent!");
 		assert(e.arenaIndex == index, "Invalid arena index!");
@@ -214,6 +224,14 @@ public:
 	}
 
 	void freeLarge(ref CachedExtentMap emap, Extent* e) shared {
+		/**
+		 * A concurrent mark may hold the extent. Leave it: the program does
+		 * not use it anymore, so the next collection finds it unreachable.
+		 */
+		if (unlikely(gMarkActive.load() != 0)) {
+			return;
+		}
+
 		assert(e !is null, "Extent is null!");
 		assert(e.isLarge(), "Expected a large extent!");
 		assert(e.arenaIndex == index, "Invalid arena index!");
