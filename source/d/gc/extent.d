@@ -100,6 +100,12 @@ struct ExtentClass {
  */
 shared Atomic!ubyte gSweepCycle;
 
+/**
+ * Set once anything with a finalizer was allocated. While it is clear, the
+ * sweep skips its pass for finalizers.
+ */
+shared Atomic!ubyte gAnyFinalizers;
+
 struct Extent {
 private:
 	/**
@@ -252,10 +258,37 @@ public:
 		return cast(ubyte) _sweepTag;
 	}
 
+	/**
+	 * Only the thread that owns the extent for the sweep calls this: before
+	 * it is published, or under the bin lock for a slab that the sweep has
+	 * not visited yet, which nothing allocates from.
+	 */
 	@property
 	void sweepTag(ubyte tag) {
-		_sweepTag = tag;
+		_sweepTag = (_sweepTag & ~size_t(0xff)) | tag;
 	}
+
+	/**
+	 * Whether a slot of this slab ever got a finalizer (a destructor, as
+	 * opposed to the metadata every appendable array has). Once set, it stays
+	 * set. It lets the sweep skip the slabs that cannot have one without
+	 * touching their slots.
+	 */
+	@property
+	bool hasFinalizers() const {
+		return (_sweepTag & HasFinalizersBit) != 0;
+	}
+
+	void setHasFinalizers() {
+		gAnyFinalizers.store(1);
+
+		if (!hasFinalizers) {
+			import core.atomic : atomicOp;
+			atomicOp!"|="(*cast(shared(size_t)*) &_sweepTag, HasFinalizersBit);
+		}
+	}
+
+	private enum HasFinalizersBit = size_t(1) << 8;
 
 	/**
 	 * True while a sweep is running and has not visited this extent yet.
@@ -615,6 +648,11 @@ public:
 
 	void setFinalizer(Finalizer finalizer) {
 		assert(isLarge(), "Cannot set finalizer on a slab alloc!");
+
+		if (finalizer !is null) {
+			gAnyFinalizers.store(1);
+		}
+
 		_metadata.largeData.finalizer = finalizer;
 	}
 

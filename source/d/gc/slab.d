@@ -243,6 +243,10 @@ public:
 		// found at the start, rather than end, of the memory that it occupies,
 		// and the freespace (newMetadata) will collide with the finalizer.
 		slotMetadata.data.finalizerData = newMetadata | finalizerValue;
+		if (hasFinalizer) {
+			e.setHasFinalizers();
+		}
+
 		e.enableMetadata(index);
 		_hasMetadata = true;
 	}

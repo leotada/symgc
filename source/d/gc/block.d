@@ -94,7 +94,7 @@ private:
 	 * The GC cycle whose sweep has visited this block, or in which the block
 	 * was created. Zero for a block no sweep has seen.
 	 */
-	ubyte _sweepSerial;
+	ushort _sweepSerial;
 
 	uint usedCount;
 	uint dirtyCount;
@@ -171,12 +171,12 @@ public:
 	}
 
 	@property
-	ubyte sweepSerial() const {
+	ushort sweepSerial() const {
 		return _sweepSerial;
 	}
 
 	@property
-	void sweepSerial(ubyte s) {
+	void sweepSerial(ushort s) {
 		_sweepSerial = s;
 	}
 

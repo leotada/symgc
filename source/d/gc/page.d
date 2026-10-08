@@ -16,6 +16,16 @@ import d.gc.time;
 __gshared ulong[8] gSweepT;
 
 /**
+ * What a thread that helps with the sweep found: nothing to do (no sweep, or
+ * it is over), it did a step, or the work is there but it is not for it now.
+ */
+enum AssistResult : ubyte {
+	Done,
+	Worked,
+	Waiting,
+}
+
+/**
  * The share of the time, in percent, the background sweeper may run. 100
  * disables pacing.
  */
@@ -98,6 +108,15 @@ private:
 	 */
 	enum SweepPhase : ubyte {
 		Idle,
+
+		/**
+		 * Run the finalizers of every dead object first. Only then are dead
+		 * slots released, so a finalizer that reads another dead object
+		 * finds it as it was, even though threads allocate while we sweep.
+		 */
+		DenseFinalize,
+		SparseFinalize,
+
 		DenseScan,
 		DenseMinimize,
 		SparseScan,
@@ -995,17 +1014,38 @@ private:
 	 * A mutator that allocates faster than the sweeper reclaims helps with
 	 * the sweep: it does one step, and returns whether there is more to do.
 	 */
-	package bool assistSweep(ref CachedExtentMap emap) shared {
+	package AssistResult assistSweep(ref CachedExtentMap emap) shared {
 		auto self = cast(PageFiller*) &this;
+
+		// Finalizers are user code, and it does not run on a thread that
+		// is in the middle of an allocation: leave them to the sweeper. A
+		// racy look at the phase, to not queue up for the lock of a sweeper
+		// that wants it for the next step.
+		auto phase = self.sweepPhase;
+		if (phase == SweepPhase.DenseFinalize || phase == SweepPhase.SparseFinalize) {
+			return AssistResult.Waiting;
+		}
 
 		mutex.lock();
 		scope(exit) mutex.unlockFairly();
 
 		if (self.sweepPhase == SweepPhase.Idle) {
-			return false;
+			return AssistResult.Done;
 		}
 
-		return self.sweepStep(emap, self.sweepGcCycle, self.sweepStats);
+		if (self.sweepPhase == SweepPhase.DenseFinalize
+			    || self.sweepPhase == SweepPhase.SparseFinalize) {
+			return AssistResult.Waiting;
+		}
+
+		// Another thread in the middle of a step counts as waiting.
+		if (self.sweepStepping) {
+			return AssistResult.Waiting;
+		}
+
+		return self.sweepStep(emap, self.sweepGcCycle, self.sweepStats)
+			? AssistResult.Worked
+			: AssistResult.Done;
 	}
 
 	/**
@@ -1064,23 +1104,49 @@ private:
 		enum MinRetainedPages = 1024;
 		sweepRetain = max(MinRetainedPages, gSweepRetainPages);
 
-		// The bins were emptied while the world was stopped (`cycleStart`).
-		sweepPhase = SweepPhase.DenseScan;
-		sweepNext = firstUnvisited(denseBlocks, gcCycle);
+		/**
+		 * Finalizers run before anything is released, see `SweepPhase`.
+		 * The bins were emptied while the world was stopped (`cycleStart`).
+		 */
+		import d.gc.extent : gAnyFinalizers;
+		if (gAnyFinalizers.load() == 0) {
+			sweepPhase = SweepPhase.DenseScan;
+			sweepNext = firstUnvisited(denseBlocks, gcCycle);
+			return;
+		}
+
+		sweepPhase = SweepPhase.DenseFinalize;
+		sweepNext = firstUnvisited(denseBlocks, finalizeSerialOf(gcCycle));
+	}
+
+	/**
+	 * Each pass over the blocks marks the blocks it visits with its own
+	 * serial. They must differ from each other, from 0 (a block that no
+	 * sweep has seen), and from the serials of the sweep before.
+	 */
+	static ushort scanSerialOf(ubyte gcCycle) {
+		return gcCycle;
+	}
+
+	static ushort minimizeSerialOf(ubyte gcCycle) {
+		return cast(ushort) (gcCycle + 256);
+	}
+
+	static ushort finalizeSerialOf(ubyte gcCycle) {
+		return cast(ushort) (gcCycle + 512);
 	}
 
 	/**
 	 * The ring of all blocks is circular, and new blocks are inserted at its
 	 * head, so a pass walks forward from the block that was first when it
 	 * started and ends when it meets a block it already visited.
-	 */
-	/**
-	 * Where a pass starts: the first block that it has not visited. Blocks
+	 *
+	 * It starts at the first block that it has not visited: the first block that it has not visited. Blocks
 	 * created since the pass before are at the head of the ring, and are
 	 * tagged as visited, so they must be skipped, or the pass would end
 	 * before it started.
 	 */
-	BlockDescriptor* firstUnvisited(ref AllBlockRing ring, ubyte serial) {
+	BlockDescriptor* firstUnvisited(ref AllBlockRing ring, ushort serial) {
 		auto start = ring.first;
 		auto b = start;
 		while (b !is null) {
@@ -1097,7 +1163,7 @@ private:
 		return null;
 	}
 
-	BlockDescriptor* nextSweepBlock(ubyte serial) {
+	BlockDescriptor* nextSweepBlock(ushort serial) {
 		assert(mutex.isHeld(), "Mutex not held!");
 
 		auto b = sweepNext;
@@ -1135,12 +1201,49 @@ private:
 		assert(mutex.isHeld(), "Mutex not held!");
 
 		import d.gc.sizeclass;
-		ubyte minimizeSerial = (gcCycle + 1) & 0xff;
+		auto minimizeSerial = minimizeSerialOf(gcCycle);
+		auto finalizeSerial = finalizeSerialOf(gcCycle);
 
 		while (true) {
 			final switch (sweepPhase) with(SweepPhase) {
 				case Idle:
 					return false;
+
+				case DenseFinalize:
+					if (sweepCurrent is null) {
+						sweepCurrent = nextSweepBlock(finalizeSerial);
+						sweepPage = 0;
+					}
+
+					if (sweepCurrent is null) {
+						sweepPhase = SparseFinalize;
+						sweepNext = firstUnvisited(sparseBlocks, finalizeSerial);
+						continue;
+					}
+
+					if (finalizeDenseBlock(emap, sweepCurrent, sweepPage, SweepStepBudget, gcCycle)) {
+						sweepCurrent = null;
+					}
+
+					return true;
+
+				case SparseFinalize:
+					if (sweepCurrent is null) {
+						sweepCurrent = nextSweepBlock(finalizeSerial);
+						sweepPage = 0;
+					}
+
+					if (sweepCurrent is null) {
+						sweepPhase = DenseScan;
+						sweepNext = firstUnvisited(denseBlocks, gcCycle);
+						continue;
+					}
+
+					if (finalizeSparseBlock(emap, sweepCurrent, sweepPage, SweepStepBudget, gcCycle)) {
+						sweepCurrent = null;
+					}
+
+					return true;
 
 				case DenseScan:
 					if (sweepCurrent is null) {
@@ -1278,7 +1381,13 @@ private:
 		auto slotSize = binInfos[sizeClass].slotSize;
 		void* nimbleBase = e.address + (nimbleIndex * 64 * slotSize);
 
-		// All set bits in toFinalize have metadata.
+		// All set bits in toFinalize have metadata. If no slot of the slab
+		// ever had a finalizer, there is nothing to call, and no reason to
+		// touch the memory of the dead slots.
+		if (!e.hasFinalizers) {
+			toFinalize = 0;
+		}
+
 		while (toFinalize != 0) {
 			auto index = countTrailingZeros(toFinalize);
 			void* ptr = nimbleBase + index * slotSize;
@@ -1383,6 +1492,127 @@ private:
 		stats.bytesAllocated += (binInfos[sc].nslots - nfree) * slotSize;
 		stats.pagesCommitted += binInfos[sc].npages;
 		return false;
+	}
+
+	/**
+	 * Run the finalizers of the dead objects of a dense block, see
+	 * `SweepPhase`. Nothing is released here: the slots stay allocated, and
+	 * `finalizeSlabNimble` clears the flag so the sweep does not call the
+	 * finalizer a second time. The arguments are those of `collectDenseBlock`.
+	 */
+	bool finalizeDenseBlock(ref CachedExtentMap emap, BlockDescriptor* block,
+	                        ref uint i, ulong budget, ubyte gcCycle) {
+		assert(mutex.isHeld(), "Mutex not held!");
+
+		auto deadline = getMonotonicTime() + budget;
+		auto bem = emap.blockLookup(block.address);
+
+		while (i < PagesInBlock) {
+			if (getMonotonicTime() >= deadline) {
+				return false;
+			}
+
+			i = block.nextAllocatedPage(i);
+			if (i >= PagesInBlock) {
+				break;
+			}
+
+			auto pd = bem.lookup(i);
+			auto e = pd.extent;
+
+			// An allocation in flight, see collectDenseBlock.
+			if (e is null) {
+				i++;
+				continue;
+			}
+
+			auto ec = pd.extentClass;
+			auto sc = ec.sizeClass;
+
+			import d.gc.slab;
+			i += e.npages;
+
+			// Created after the mark, or no slot ever had a finalizer.
+			if (e.sweepTag == gcCycle || !ec.supportsMetadata || !e.hasFinalizers) {
+				continue;
+			}
+
+			auto nimble = alignUp(binInfos[sc].nslots, 64) / 64;
+			auto marks = e.getMarksDense();
+			foreach (j; 0 .. nimble) {
+				auto dead = e.slabData.rawContent[j] & ~marks[j];
+				finalizeSlabNimble(dead, e.slabMetadataFlags.rawContent[j], sc, e, j);
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * The same for a sparse block: sparse slabs, and large extents.
+	 */
+	bool finalizeSparseBlock(ref CachedExtentMap emap, BlockDescriptor* block,
+	                         ref uint i, ulong budget, ubyte gcCycle) {
+		assert(mutex.isHeld(), "Mutex not held!");
+
+		auto deadline = getMonotonicTime() + budget;
+		auto bem = emap.blockLookup(block.address);
+
+		while (i < PagesInBlock) {
+			if (getMonotonicTime() >= deadline) {
+				return false;
+			}
+
+			i = block.nextAllocatedPage(i);
+			if (i >= PagesInBlock) {
+				break;
+			}
+
+			auto pd = bem.lookup(i);
+			auto e = pd.extent;
+			if (e is null) {
+				i++;
+				continue;
+			}
+
+			auto npages = e.npages;
+			auto ec = pd.extentClass;
+			if (ec.isLarge()) {
+				// Make sure we handle huge extents correctly.
+				npages = modUp(npages, PagesInBlock);
+			}
+
+			scope(success) i += npages;
+
+			if (e.sweepTag == gcCycle) {
+				continue;
+			}
+
+			if (ec.isLarge()) {
+				if (e.isMarkedLarge(gcCycle)) {
+					continue;
+				}
+
+				auto f = e.finalizer;
+				if (f !is null) {
+					import d.gc.hooks;
+					__sd_gc_finalize(e.address, e.usedCapacity, f);
+					e.setFinalizer(null);
+				}
+
+				continue;
+			}
+
+			if (!e.hasFinalizers) {
+				continue;
+			}
+
+			auto marks = e.getMarksSparse(gcCycle);
+			auto dead = e.slabData.rawContent[0] & ~marks;
+			finalizeSlabNimble(dead, e.slabMetadataFlags.rawContent[0], ec.sizeClass, e, 0);
+		}
+
+		return true;
 	}
 
 	/**

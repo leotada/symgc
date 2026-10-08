@@ -55,7 +55,7 @@ struct Collector {
 	 */
 	void assistSweep() {
 		import d.gc.extent : gSweepCycle;
-		import d.gc.page : gSweepHardLimit;
+		import d.gc.page : gSweepHardLimit, AssistResult;
 
 		if (gSweepCycle.load() == 0 || Arena.computeUsedPageCount() <= gSweepHardLimit) {
 			return;
@@ -65,21 +65,27 @@ struct Collector {
 		scope(exit) threadCache.endCollection();
 
 		while (gSweepCycle.load() != 0 && Arena.computeUsedPageCount() > gSweepHardLimit) {
-			bool more = false;
+			bool worked = false;
+			bool waiting = false;
 			foreach (i; 0 .. ArenaCount) {
 				auto a = Arena.getIfInitialized(i);
 				if (a !is null) {
-					more |= a.assistSweep(emap);
+					auto r = a.assistSweep(emap);
+					worked |= r == AssistResult.Worked;
+					waiting |= r == AssistResult.Waiting;
 				}
 			}
 
-			if (!more) {
+			if (!worked && !waiting) {
 				break;
 			}
 
-			// Another thread may be in the middle of a step.
-			import symgc.thread : sched_yield;
-			sched_yield();
+			if (!worked) {
+				// The sweeper is on a part that is not ours (finalizers) or
+				// another thread is in a step: do not fight it for the lock.
+				import core.sys.posix.unistd : usleep;
+				usleep(50);
+			}
 		}
 	}
 

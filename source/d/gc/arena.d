@@ -233,7 +233,7 @@ package:
 		return filler.collect(emap, gcCycle, stats);
 	}
 
-	bool assistSweep(ref CachedExtentMap emap) shared {
+	AssistResult assistSweep(ref CachedExtentMap emap) shared {
 		return filler.assistSweep(emap);
 	}
 
