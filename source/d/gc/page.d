@@ -11,6 +11,9 @@ import d.gc.util;
 
 import symgc.intrinsics;
 
+import d.gc.time;
+__gshared ulong[8] gSweepT;
+
 struct PageFiller {
 private:
 	@property package
@@ -887,6 +890,7 @@ private:
 		assert(mutex.isHeld(), "Mutex not held!");
 
 		PriorityExtentHeap deadExtents;
+		auto tD0 = getMonotonicTime();
 
 		for (auto r = denseBlocks.range; !r.empty; r.popFront()) {
 			auto block = r.front;
@@ -961,12 +965,16 @@ private:
 			}
 		}
 
+		auto tD1 = getMonotonicTime();
 		while (!deadExtents.empty) {
 			freeExtentLocked(emap, deadExtents.pop());
 		}
+		auto tD2 = getMonotonicTime();
 
 		collectOutlinedBitmaps();
+		auto tD3 = getMonotonicTime();
 		minimizeDense();
+		gSweepT[0] += tD1 - tD0; gSweepT[1] += tD2 - tD1; gSweepT[2] += tD3 - tD2; gSweepT[3] += getMonotonicTime() - tD3;
 	}
 
 	uint minimizeDense() {
@@ -988,6 +996,7 @@ private:
 		assert(mutex.isHeld(), "Mutex not held!");
 
 		PriorityExtentHeap deadExtents;
+		auto tS0 = getMonotonicTime();
 
 		for (auto r = sparseBlocks.range; !r.empty; r.popFront()) {
 			auto block = r.front;
@@ -1071,11 +1080,13 @@ private:
 			}
 		}
 
+		auto tS1 = getMonotonicTime();
 		while (!deadExtents.empty) {
 			freeExtentLocked(emap, deadExtents.pop());
 		}
-
+		auto tS2 = getMonotonicTime();
 		minimizeSparse();
+		gSweepT[4] += tS1 - tS0; gSweepT[5] += tS2 - tS1; gSweepT[6] += getMonotonicTime() - tS2;
 	}
 
 	uint minimizeSparse() {
