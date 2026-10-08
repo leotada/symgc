@@ -73,7 +73,18 @@ struct Bin {
 				auto e = slabs.top;
 				if (unlikely(e is null)) {
 					if (freshSlab !is null) {
-						// We have a fresh slab, use it!
+						/**
+						 * We have a fresh slab, use it! It may have been made
+						 * before a collection started its epoch and reach the
+						 * bin after the bins were emptied. It is new and empty:
+						 * born in the epoch, so nothing marks it or sweeps it.
+						 */
+						import d.gc.extent : gSweepCycle;
+						auto epoch = gSweepCycle.load();
+						if (unlikely(epoch != 0 && freshSlab.sweepTag != epoch)) {
+							freshSlab.sweepTag = epoch;
+						}
+
 						slabs.insert(freshSlab);
 						freshSlab = null;
 						continue;
@@ -217,6 +228,12 @@ package:
 	void clearForCollection() shared {
 		mutex.lock();
 		scope(exit) mutex.unlock();
+
+		(cast(PriorityExtentHeap*) &slabs).clear();
+	}
+
+	void clearLocked() shared {
+		assert(mutex.isHeld(), "Mutex not held!");
 
 		(cast(PriorityExtentHeap*) &slabs).clear();
 	}

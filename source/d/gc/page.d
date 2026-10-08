@@ -138,6 +138,15 @@ private:
 	// A step is running. See `sweepStep`.
 	bool sweepStepping;
 
+	// The concurrent prepare of the mark bits: where it is, like the sweep.
+	bool preparing;
+	uint prepareEpoch;
+	ushort prepareSerial;
+	BlockDescriptor* prepareNext;
+	BlockDescriptor* prepareCurrent;
+	uint preparePage;
+	ulong[] prepareBitmaps;
+
 	// How many more free pages this sweep may keep instead of returning them
 	// to the OS, see `minimizeBlock`.
 	size_t sweepRetain;
@@ -383,6 +392,43 @@ public:
 		scope(exit) mutex.unlock();
 
 		(cast(PageFiller*) &this).prepareGCCycleImpl(emap);
+	}
+
+	/**
+	 * Prepare the mark bits with the program running (a concurrent mark),
+	 * one step at a time with the mutex released in between, like the sweep.
+	 * The epoch of the collection must have started: extents and blocks
+	 * created from then on are born, need no marks, and are skipped.
+	 */
+	void prepareConcurrent(ref CachedExtentMap emap, ubyte gcCycle) shared {
+		auto self = cast(PageFiller*) &this;
+
+		{
+			mutex.lock();
+			scope(exit) mutex.unlock();
+
+			self.beginPrepareImpl(gcCycle);
+		}
+
+		while (true) {
+			bool more;
+
+			{
+				mutex.lock();
+				scope(exit) mutex.unlockFairly();
+
+				more = self.prepareStepImpl(emap);
+			}
+
+			if (!more) {
+				break;
+			}
+
+			import symgc.thread : sched_yield;
+			for (uint i = 0; mutex.hasContenders && i < 64; i++) {
+				sched_yield();
+			}
+		}
 	}
 
 	/**
@@ -960,6 +1006,133 @@ private:
 		return ob.bitmaps;
 	}
 
+	void beginPrepareImpl(ubyte gcCycle) {
+		assert(mutex.isHeld(), "Mutex not held!");
+		assert(!preparing, "A prepare is already running!");
+
+		prepareEpoch = gSweepCycle.load();
+		// Distinct from the serials of the sweep (up to 767) and of the cycle before.
+		prepareSerial = cast(ushort) (768 + gcCycle);
+		assert(prepareEpoch != 0, "No collection is running!");
+
+		preparing = true;
+		prepareNext = denseBlocks.first;
+		prepareCurrent = null;
+		prepareBitmaps = [];
+	}
+
+	/**
+	 * Same walk as `nextSweepBlock`, with a cursor of its own, and its own
+	 * serial (a prepare is a pass over the blocks like those of the sweep).
+	 */
+	BlockDescriptor* nextPrepareBlock() {
+		assert(mutex.isHeld(), "Mutex not held!");
+
+
+		while (true) {
+			auto b = prepareNext;
+			if (b is null || b.sweepSerial == prepareSerial) {
+				prepareNext = null;
+				return null;
+			}
+
+			b.sweepSerial = prepareSerial;
+			prepareNext = b.allNext;
+
+			if (b.bornEpoch == prepareEpoch) {
+				continue;
+			}
+
+			return b;
+		}
+	}
+
+	bool prepareStepImpl(ref CachedExtentMap emap) {
+		assert(mutex.isHeld(), "Mutex not held!");
+
+		if (prepareCurrent is null) {
+			prepareCurrent = nextPrepareBlock();
+			preparePage = 0;
+
+			if (prepareCurrent is null) {
+				// The bitmap pages we did not use stay on the list, and are
+				// freed with the others by the sweep.
+				preparing = false;
+				prepareBitmaps = [];
+				return false;
+			}
+		}
+
+		if (prepareDenseBlock(emap, prepareCurrent, preparePage, SweepStepBudget)) {
+			prepareCurrent = null;
+		}
+
+		return true;
+	}
+
+	/**
+	 * `prepareGCCycleImpl` for one dense block, in a step of bounded length,
+	 * with the program running. Returns true when the block is done.
+	 */
+	bool prepareDenseBlock(ref CachedExtentMap emap, BlockDescriptor* block,
+	                       ref uint i, ulong budget) {
+		assert(mutex.isHeld(), "Mutex not held!");
+
+		auto deadline = getMonotonicTime() + budget;
+		auto bem = emap.blockLookup(block.address);
+
+		while (i < PagesInBlock) {
+			if (getMonotonicTime() >= deadline) {
+				return false;
+			}
+
+			i = block.nextAllocatedPage(i);
+			if (i >= PagesInBlock) {
+				break;
+			}
+
+			auto pd = bem.lookup(i);
+			auto e = pd.extent;
+
+			// An allocation in flight: born after the epoch started.
+			if (e is null) {
+				i++;
+				continue;
+			}
+
+			auto ec = pd.extentClass;
+			auto sc = ec.sizeClass;
+
+			import d.gc.slab;
+			i += binInfos[sc].npages;
+
+			if (e.sweepTag == prepareEpoch) {
+				continue;
+			}
+
+			if (ec.supportsInlineMarking) {
+				import d.gc.bitmap;
+				auto bmp = cast(Bitmap!128*) &e.slabMetadataMarks();
+				bmp.clear();
+				continue;
+			}
+
+			auto nslots = binInfos[sc].nslots;
+			auto nimble = alignUp(nslots, 64) / 64;
+			if (prepareBitmaps.length < nimble) {
+				prepareBitmaps = allocGCBitmap();
+			}
+
+			assert(prepareBitmaps.length >= nimble,
+			       "Failed to allocate GC bitmaps.");
+
+			e.outlineMarksBuffer = prepareBitmaps.ptr;
+			prepareBitmaps = prepareBitmaps[nimble .. prepareBitmaps.length];
+		}
+
+		return true;
+	}
+
 	void prepareGCCycleImpl(ref CachedExtentMap emap) {
 		assert(mutex.isHeld(), "Mutex not held!");
 
@@ -1179,6 +1352,14 @@ private:
 
 		if (sweepNext is block) {
 			sweepNext = block.allNext;
+		}
+
+		if (prepareNext is block) {
+			prepareNext = block.allNext;
+		}
+
+		if (prepareCurrent is block) {
+			prepareCurrent = null;
 		}
 
 		// A block that leaves the ring is empty, or about to be reused for a

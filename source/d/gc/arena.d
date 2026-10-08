@@ -247,6 +247,10 @@ package:
 		filler.prepareGCCycle(emap);
 	}
 
+	void prepareConcurrent(ref CachedExtentMap emap, ubyte gcCycle) shared {
+		filler.prepareConcurrent(emap, gcCycle);
+	}
+
 	void collect(ref CachedExtentMap emap, ubyte gcCycle, ref CollectStats stats) shared {
 		return filler.collect(emap, gcCycle, stats);
 	}
@@ -258,6 +262,35 @@ package:
 	void clearBinsForCollection() shared {
 		foreach (i; 0 .. BinCount) {
 			bins[i].clearForCollection();
+		}
+	}
+
+	/**
+	 * Take the lock of every bin, in order. A collection that starts while
+	 * the program runs does so with all of them held: it starts the epoch and
+	 * empties the bins as one step, so no free or allocation can fall between
+	 * the two (a slab that enters a bin after the epoch started and before the
+	 * bins were emptied would be dropped from the heap while it still links
+	 * to it). Nobody holds two bin locks at a time, so this cannot deadlock.
+	 */
+	void lockBins() shared {
+		foreach (i; 0 .. BinCount) {
+			bins[i].mutex.lock();
+		}
+	}
+
+	void unlockBins() shared {
+		foreach_reverse (i; 0 .. BinCount) {
+			bins[i].mutex.unlock();
+		}
+	}
+
+	/**
+	 * `clearBinsForCollection` when `lockBins` is held.
+	 */
+	void clearLockedBins() shared {
+		foreach (i; 0 .. BinCount) {
+			bins[i].clearLocked();
 		}
 	}
 

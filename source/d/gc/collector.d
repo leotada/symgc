@@ -41,6 +41,7 @@ struct CycleContext {
 	ulong pauseStartTime, tStopped, tPrepared, tMarked, tFlushed;
 	ulong startPause, remarkPause, concurrentMark;
 	ulong[4] remarkParts; // stop, dirty pages, mark, restart
+	ulong[3] preamble;    // arm, epoch and bins, prepare
 	ulong scanBytesBeforeRemark, scanBytesRemark;
 	uint rounds;
 	size_t lastRoundPages, remarkPages;
@@ -368,21 +369,50 @@ private:
 		ctx.threadCount = threadCount;
 		startGCThreads(threadCount - 1);
 
-		// 1. Arm, with the program running.
+		/**
+		 * 1. Arm the tracker, with the program running. This comes before
+		 *    anything else: the mark skips the extents born from the epoch
+		 *    on, relying on their pages being reported when written, and a
+		 *    write that happened before the arm is not reported afterwards.
+		 */
+		auto tPre0 = getMonotonicTime();
 		dirtyArm();
+		auto tPre1 = getMonotonicTime();
 
-		// 2. The start pause.
-		ctx.pauseStartTime = getMonotonicTime();
-		stopTheWorld();
-		ctx.tStopped = getMonotonicTime();
+		/**
+		 * 2. Start the epoch. From now on the extents and blocks the program
+		 *    creates are born, need no marks and are skipped, so preparing
+		 *    the marks of the others can take its time. The regions that
+		 *    exist now hold everything that is not born.
+		 */
+		// Start the epoch and empty the bins as one step, with the lock of
+		// every bin held: in either order as two steps, a slab can slip in
+		// between (an old one into a bin, or a born one that is then dropped).
+		startEpochAndClearBins();
+		setSweepLimits();
+		gMarkActive.store(1);
+		auto tPre2 = getMonotonicTime();
 
 		auto dataRange = gDataRegionAllocator.computeAddressRange();
 		auto ptrRange = gPointerRegionAllocator.computeAddressRange();
 		auto space = dataRange.merge(ptrRange);
 
-		cycleStart(space, gcCycle, false);
-		gMarkActive.store(1);
+		// 3. Prepare the mark bits, still without a pause.
+		foreach (i; 0 .. ArenaCount) {
+			import d.gc.arena;
+			auto a = Arena.getIfInitialized(i);
+			if (a !is null) {
+				a.prepareConcurrent(emap, gcCycle);
+			}
+		}
+
 		ctx.tPrepared = getMonotonicTime();
+		ctx.preamble = [tPre1 - tPre0, tPre2 - tPre1, ctx.tPrepared - tPre2];
+
+		// 4. The start pause: only to list the stacks.
+		ctx.pauseStartTime = getMonotonicTime();
+		stopTheWorld();
+		ctx.tStopped = getMonotonicTime();
 
 		/**
 		 * Put the roots, the stacks and the thread local storage on the work
@@ -489,8 +519,8 @@ private:
 			 * the program got from the bins meanwhile are unswept for the
 			 * new epoch, so the bins must be empty again.
 			 */
-			clearBins();
 			startEpoch();
+			clearBins();
 
 			prepareGCCycle();
 			markRoundGC(gcCycle, space, (shared(Scanner)* s) {
@@ -563,6 +593,9 @@ private:
 				fprintf(stderr, "gcconc startpause=%.0f remarkpause=%.0f concurrent_mark=%.0f rounds=%u last_round_pages=%zu remark_pages=%zu us\n",
 					ctx.startPause / us, ctx.remarkPause / us, ctx.concurrentMark / us,
 					ctx.rounds, ctx.lastRoundPages, ctx.remarkPages);
+				fprintf(stderr, "gcpre arm=%.0f epoch_and_bins=%.0f prepare=%.0f us\n",
+					ctx.preamble[0] / us, ctx.preamble[1] / us, ctx.preamble[2] / us);
+
 				if (ctx.fellBack) {
 					fprintf(stderr, "gcfallback: dirty tracking failed, the remark marked everything again\n");
 				}
@@ -608,18 +641,28 @@ private:
 
 		prepareGCCycle();
 
-		clearBins();
 		startEpoch();
+		clearBins();
+		setSweepLimits();
 
-		/**
-		 * The sweeper is paced unless the heap grows past 1/8 over the
-		 * collection target, and the threads that allocate help when it
-		 * grows past 1/4. The limits are relative to the target, which
-		 * comes from what survived, and not to the heap size now: that
-		 * one includes whatever the heap grew by during the last sweep, so
-		 * limits based on it would grow from one cycle to the next.
-		 */
-		import d.gc.page : gSweepGrowthLimit, gSweepHardLimit;
+		// The SATB log is for a mark that stops the world; the concurrent
+		// mark tracks the pages the program writes instead.
+		if (satb) {
+			auto lo = managedAddressSpace.ptr;
+			satbBegin(lo, lo + managedAddressSpace.size);
+		}
+	}
+
+	/**
+	 * The sweeper is paced unless the heap grows past 1/8 over the
+	 * collection target, and the threads that allocate help when it
+	 * grows past 1/4. The limits are relative to the target, which
+	 * comes from what survived, and not to the heap size now: that
+	 * one includes whatever the heap grew by during the last sweep, so
+	 * limits based on it would grow from one cycle to the next.
+	 */
+	void setSweepLimits() {
+		import d.gc.page : gSweepGrowthLimit, gSweepHardLimit, gSweepRetainPages;
 		auto usedPages = Arena.computeUsedPageCount();
 		auto target = (cast(CollectorState*) &gCollectorState).nextTarget;
 		version(Symgc_phase_trace) {
@@ -629,16 +672,7 @@ private:
 
 		gSweepGrowthLimit = target + target / 8;
 		gSweepHardLimit = target + target / 4;
-
-		import d.gc.page : gSweepRetainPages;
 		gSweepRetainPages = target;
-
-		// The SATB log is for a mark that stops the world; the concurrent
-		// mark tracks the pages the program writes instead.
-		if (satb) {
-			auto lo = managedAddressSpace.ptr;
-			satbBegin(lo, lo + managedAddressSpace.size);
-		}
 	}
 
 	/**
@@ -653,6 +687,41 @@ private:
 			if (a !is null) {
 				a.clearBinsForCollection();
 			}
+		}
+	}
+
+	/**
+	 * Start the epoch and empty the bins as one step, with every bin locked,
+	 * for a collection that starts with the program running (see
+	 * `Arena.lockBins`).
+	 */
+	void startEpochAndClearBins() {
+		import d.gc.arena;
+
+		/**
+		 * The set of arenas is taken once: an arena can be initialized by
+		 * another thread at any time, and unlocking one we did not lock would
+		 * release a lock somebody else holds.
+		 */
+		shared(Arena)*[ArenaCount] locked;
+		uint count = 0;
+
+		foreach (i; 0 .. ArenaCount) {
+			auto a = Arena.getIfInitialized(i);
+			if (a !is null) {
+				a.lockBins();
+				locked[count++] = a;
+			}
+		}
+
+		startEpoch();
+
+		foreach (a; locked[0 .. count]) {
+			a.clearLockedBins();
+		}
+
+		foreach_reverse (a; locked[0 .. count]) {
+			a.unlockBins();
 		}
 	}
 
