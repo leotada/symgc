@@ -1012,7 +1012,12 @@ private:
 			 */
 			version(linux) {
 				import core.sys.posix.sys.resource : setpriority, PRIO_PROCESS;
-				setpriority(PRIO_PROCESS, 0, 10);
+				int nice = 10;
+				if (auto env = getenv("SYMGC_SWEEP_NICE")) {
+					nice = atoi(env);
+				}
+
+				setpriority(PRIO_PROCESS, 0, nice);
 			}
 
 			(cast(shared(Sweeper)*) arg).run();
