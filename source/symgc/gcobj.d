@@ -225,6 +225,7 @@ final class SnazzyGC : GC
 	 */
 	void* realloc(void* p, size_t size, uint bits, const TypeInfo ti) nothrow
 	{
+		checkNotInFinalizer();
 		return __sd_gc_hook_realloc(p, size, (bits & BlkAttr.NO_SCAN) == 0);
 	}
 
@@ -466,8 +467,24 @@ void* getContextPointer(uint bits, const TypeInfo ti) nothrow @nogc
 	return null;
 }
 
+/**
+ * A finalizer runs while the collector holds the page filler's lock, so an
+ * allocation from it would wait for itself forever. It is an error in D too:
+ * the other collectors throw InvalidMemoryOperationError.
+ */
+void checkNotInFinalizer() nothrow
+{
+	import d.gc.tcache;
+	if (threadCache.inFinalizer) {
+		import core.exception : onInvalidMemoryOperationError;
+		onInvalidMemoryOperationError();
+	}
+}
+
 void *sdcAllocate(size_t size, uint bits, bool zeroData, const TypeInfo ti) nothrow
 {
+	checkNotInFinalizer();
+
 	if (size == 0)
 		return null;
 
