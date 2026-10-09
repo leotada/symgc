@@ -93,6 +93,23 @@ uint __sd_gc_disable() {
 	return disableAutomaticCollections();
 }
 
+/**
+ * Time lost to memory management, in nanoseconds: `dst[0]` the allocator's
+ * slow paths, `dst[1]` starting or helping a collection, `dst[2]` stopped by
+ * the collector. For the calling thread since it started, or for all threads
+ * since the program started. Read it before and after a frame for the
+ * collector's share of that frame.
+ */
+void __sd_gc_time_thread(ulong* dst) {
+	import d.gc.gctime;
+	readThread(dst);
+}
+
+void __sd_gc_time_total(ulong* dst) {
+	import d.gc.gctime;
+	readTotal(dst);
+}
+
 PageDescriptor __sd_gc_maybe_get_page_descriptor(void* ptr) {
 	return threadCache.maybeGetPageDescriptor(ptr);
 }

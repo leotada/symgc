@@ -129,6 +129,11 @@ void suspendThreadImpl(ThreadState* ts, void* stackTop) {
 	threadCache.stackTop = stackTop;
 	scope(exit) threadCache.stackTop = null;
 
+	// Time stopped by the collector.
+	import d.gc.gctime;
+	auto gcTimer = GcTimer.begin(GcTimeKind.Pause);
+	scope(exit) gcTimer.end();
+
 	import d.gc.hooks;
 	__sd_gc_pre_suspend_hook(stackTop);
 	scope(exit) __sd_gc_post_suspend_hook();

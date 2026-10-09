@@ -543,6 +543,11 @@ private:
 			return ptr;
 		}
 
+		// The slow path: time lost to memory management.
+		import d.gc.gctime;
+		auto gcTimer = GcTimer.begin(GcTimeKind.Alloc);
+		scope(exit) gcTimer.end();
+
 		// We are about to allocate, make room for it if needed.
 		version(Symgc_phase_trace) {
 			import d.gc.time;
@@ -667,6 +672,10 @@ private:
 	void* allocLarge(uint pages, bool containsPointers, bool zero) {
 		assert(!isScanningThread, "Trying to allocate while in scanning thread!");
 		ensureThreadCacheIsInitialized();
+
+		import d.gc.gctime;
+		auto gcTimer = GcTimer.begin(GcTimeKind.Alloc);
+		scope(exit) gcTimer.end();
 
 		// We are about to allocate, make room for it if needed.
 		maybeRunGCCycle();
@@ -846,6 +855,10 @@ private:
 		}
 
 		nextGCRun = allocated + BlockSize;
+
+		import d.gc.gctime;
+		auto gcTimer = GcTimer.begin(GcTimeKind.Collect);
+		scope(exit) gcTimer.end();
 
 		import d.gc.collector;
 		auto collector = Collector(&this);
