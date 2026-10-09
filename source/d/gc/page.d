@@ -693,6 +693,17 @@ private:
 		if (block.empty) {
 			releaseBlock(e, block);
 		} else {
+			/**
+			 * The block goes back in its heap before the lock is released
+			 * for the region. With the block out of every heap and the lock
+			 * dropped, another thread that frees (or grows) an extent of
+			 * the same block calls `unregisterBlock` on a block that is
+			 * not in a heap, which unlinks a node that is not linked and
+			 * leaves a cycle in the heap: the hang seen in the
+			 * multi-threaded game, in the pairwise merge of the heap.
+			 */
+			registerBlock(block);
+
 			// If the extent is larger than a block,
 			// we need to release the extra region.
 			if (e.npages > PagesInBlock) {
@@ -701,8 +712,6 @@ private:
 
 				regionAllocator.release(e.address, e.npages / PagesInBlock);
 			}
-
-			registerBlock(block);
 		}
 
 		usedPageCount.fetchSub(e.npages);
