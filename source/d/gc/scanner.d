@@ -366,6 +366,22 @@ private:
 
 	ThreadHandle[] threads;
 
+	/**
+	 * Copies of the roots taken at the start pause of a concurrent mark.
+	 * The stacks and TLS blocks listed in that pause are read after the world
+	 * restarts, and a thread that exits in between unmaps them (glibc keeps
+	 * static TLS in the stack mapping). So the pause copies each root range
+	 * here and the mark reads the copy. The chunks are kept from one cycle to
+	 * the next and reset at each start pause, when no work item refers to them.
+	 */
+	enum MaxRootChunks = 32;
+	enum MinRootChunk = 1024 * 1024;
+	void*[MaxRootChunks] rootChunks;
+	size_t[MaxRootChunks] rootChunkSizes;
+	size_t rootChunkCount;
+	size_t rootChunkCurrent;
+	size_t rootChunkUsed;
+
 public:
 
 	@property
@@ -601,6 +617,81 @@ public:
 
 	void processGlobal(const(void*)[] range) shared {
 		addToWorkList(range);
+	}
+
+	/**
+	 * Start of the start pause of a concurrent mark: the copies of the last
+	 * cycle are no longer referred to.
+	 */
+	void resetRootCopies() shared {
+		auto t = cast(Scanner*) &this;
+		t.rootChunkCurrent = 0;
+		t.rootChunkUsed = 0;
+	}
+
+	/**
+	 * Like `processGlobal`, for the start pause of a concurrent mark: the
+	 * range is copied, with the world stopped, and the copy is what the mark
+	 * reads once the world runs again.
+	 */
+	void processGlobalCopy(const(void*)[] range) shared {
+		auto t = cast(Scanner*) &this;
+		auto bytes = range.length * PointerSize;
+		if (bytes == 0) {
+			return;
+		}
+
+		auto copy = t.rootCopySpace(bytes);
+		if (copy is null) {
+			// Out of chunks or of memory: the range is read in place, as before.
+			addToWorkList(range);
+			return;
+		}
+
+		import core.stdc.string : memcpy;
+		memcpy(copy, range.ptr, bytes);
+		addToWorkList((cast(const(void*)*) copy)[0 .. range.length]);
+	}
+
+	private void* rootCopySpace(size_t bytes) {
+		while (rootChunkCurrent < rootChunkCount) {
+			if (rootChunkUsed + bytes <= rootChunkSizes[rootChunkCurrent]) {
+				auto p = rootChunks[rootChunkCurrent] + rootChunkUsed;
+				rootChunkUsed += bytes;
+				return p;
+			}
+
+			rootChunkCurrent++;
+			rootChunkUsed = 0;
+		}
+
+		if (rootChunkCount == MaxRootChunks) {
+			return null;
+		}
+
+		// A new chunk, twice the last one, and large enough for this range.
+		size_t size = rootChunkCount == 0 ? MinRootChunk : 2 * rootChunkSizes[rootChunkCount - 1];
+		while (size < bytes) {
+			size *= 2;
+		}
+
+		version(Posix) {
+			import core.sys.posix.sys.mman;
+			auto p = mmap(null, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+			if (p == MAP_FAILED) {
+				return null;
+			}
+		} else {
+			// The concurrent mark is Linux only: nothing to copy for.
+			return null;
+		}
+
+		rootChunks[rootChunkCount] = p;
+		rootChunkSizes[rootChunkCount] = size;
+		rootChunkCurrent = rootChunkCount;
+		rootChunkCount++;
+		rootChunkUsed = bytes;
+		return p;
 	}
 
 	void addToWorkList(const(void*)[] range) shared {

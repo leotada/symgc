@@ -409,7 +409,7 @@ private:
 		ctx.tPrepared = getMonotonicTime();
 		ctx.preamble = [tPre1 - tPre0, tPre2 - tPre1, ctx.tPrepared - tPre2];
 
-		// 4. The start pause: only to list the stacks.
+		// 4. The start pause: only to copy the roots.
 		ctx.pauseStartTime = getMonotonicTime();
 		stopTheWorld();
 		ctx.tStopped = getMonotonicTime();
@@ -417,13 +417,18 @@ private:
 		/**
 		 * Put the roots, the stacks and the thread local storage on the work
 		 * list now: the stacks are only valid while the world is stopped, and
-		 * most of a D program hangs off its thread locals. This only lists
-		 * the ranges. They are read, and traced, after the world restarts, so
-		 * they may have changed by then: the remark pause scans them again.
+		 * most of a D program hangs off its thread locals. The ranges are
+		 * copied, not traced: the copies are traced after the world restarts.
+		 * Reading the ranges themselves then would fault when a thread exits
+		 * meanwhile (its stack and TLS are unmapped). The remark pause scans
+		 * the live roots again.
 		 */
 		markBeginGC(gcCycle, space);
 		markSeedGC((shared(Scanner)* s) {
-			__sd_gc_global_scan(cast(ScanDg) &s.processGlobal);
+			// Copied now: a thread that exits after the restart takes its
+			// stack and TLS with it.
+			s.resetRootCopies();
+			__sd_gc_global_scan(cast(ScanDg) &s.processGlobalCopy);
 		});
 
 		restartTheWorld();
