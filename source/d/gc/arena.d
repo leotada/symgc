@@ -255,6 +255,18 @@ package:
 		return filler.collect(emap, gcCycle, stats);
 	}
 
+	void beginSweep(ubyte gcCycle) shared {
+		filler.beginSweep(gcCycle);
+	}
+
+	void sweepFinalizers(ref CachedExtentMap emap, ubyte gcCycle) shared {
+		filler.sweepFinalizers(emap, gcCycle);
+	}
+
+	void finishSweep(ref CachedExtentMap emap, ubyte gcCycle, ref CollectStats stats) shared {
+		filler.finishSweep(emap, gcCycle, stats);
+	}
+
 	AssistResult assistSweep(ref CachedExtentMap emap) shared {
 		return filler.assistSweep(emap);
 	}

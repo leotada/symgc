@@ -436,14 +436,45 @@ public:
 	 * is released between blocks.
 	 */
 	void collect(ref CachedExtentMap emap, ubyte gcCycle, ref CollectStats stats) shared {
+		beginSweep(gcCycle);
+		sweepFinalizers(emap, gcCycle);
+		finishSweep(emap, gcCycle, stats);
+	}
+
+	/**
+	 * The sweep of a cycle in three stages, so that the collector can run the
+	 * finalizers of all the arenas before any arena releases a slot.
+	 */
+	void beginSweep(ubyte gcCycle) shared {
 		auto self = cast(PageFiller*) &this;
 
-		{
-			mutex.lock();
-			scope(exit) mutex.unlock();
+		mutex.lock();
+		scope(exit) mutex.unlock();
 
-			self.beginSweepImpl(gcCycle);
+		self.beginSweepImpl(gcCycle);
+	}
+
+	/**
+	 * Run the finalizer phases, and stop when the sweep moves on to the next.
+	 */
+	void sweepFinalizers(ref CachedExtentMap emap, ubyte gcCycle) shared {
+		auto self = cast(PageFiller*) &this;
+
+		while (true) {
+			mutex.lock();
+			scope(exit) mutex.unlockFairly();
+
+			if (self.sweepPhase != SweepPhase.DenseFinalize
+				    && self.sweepPhase != SweepPhase.SparseFinalize) {
+				return;
+			}
+
+			self.sweepStep(emap, gcCycle, self.sweepStats);
 		}
+	}
+
+	void finishSweep(ref CachedExtentMap emap, ubyte gcCycle, ref CollectStats stats) shared {
+		auto self = cast(PageFiller*) &this;
 
 		// Mutators may do some of the work too, see `assistSweep`, so the
 		// stats of the sweep live in the filler.
@@ -1202,6 +1233,12 @@ private:
 			return AssistResult.Waiting;
 		}
 
+		// Another arena may still be running its finalizers.
+		import d.gc.extent : gFinalizeStage;
+		if (gFinalizeStage.load() != 0) {
+			return AssistResult.Waiting;
+		}
+
 		mutex.lock();
 		scope(exit) mutex.unlockFairly();
 
@@ -1411,6 +1448,14 @@ private:
 					if (sweepCurrent is null) {
 						sweepPhase = DenseScan;
 						sweepNext = denseBlocks.first;
+
+						// The other arenas may still be finalizing: nothing
+						// is released before all of them are done.
+						import d.gc.extent : gFinalizeStage;
+						if (gFinalizeStage.load() != 0) {
+							return true;
+						}
+
 						continue;
 					}
 

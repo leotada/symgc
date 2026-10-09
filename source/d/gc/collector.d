@@ -761,12 +761,38 @@ private:
 		threadCache.startCollection();
 		scope(exit) threadCache.endCollection();
 
+		/**
+		 * Every finalizer of the cycle runs before any dead slot is
+		 * released, in any arena: a destructor may read an object that is
+		 * dead too, and it can be in another arena than the one it is in.
+		 */
+		import d.gc.extent : gFinalizeStage;
+		gFinalizeStage.store(1);
+
+		foreach (i; 0 .. ArenaCount) {
+			import d.gc.arena;
+			auto a = Arena.getIfInitialized(i);
+			if (a !is null) {
+				a.beginSweep(gcCycle);
+			}
+		}
+
+		foreach (i; 0 .. ArenaCount) {
+			import d.gc.arena;
+			auto a = Arena.getIfInitialized(i);
+			if (a !is null) {
+				a.sweepFinalizers(emap, gcCycle);
+			}
+		}
+
+		gFinalizeStage.store(0);
+
 		CollectStats stats;
 		foreach (i; 0 .. ArenaCount) {
 			import d.gc.arena;
 			auto a = Arena.getIfInitialized(i);
 			if (a !is null) {
-				a.collect(emap, gcCycle, stats);
+				a.finishSweep(emap, gcCycle, stats);
 			}
 		}
 		return stats;

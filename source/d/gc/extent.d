@@ -115,6 +115,13 @@ shared Atomic!ubyte gMarkActive;
  */
 shared Atomic!ubyte gAnyFinalizers;
 
+/**
+ * Set while the finalizers of a cycle run, in every arena. A dead slot is
+ * not released anywhere until they all ran: an object in one arena can point
+ * to one in another, and its destructor may read it.
+ */
+shared Atomic!ubyte gFinalizeStage;
+
 struct Extent {
 private:
 	/**
