@@ -170,11 +170,25 @@ struct Collector {
 	}
 
 	void runGCCycle() {
-		// An explicit collection is synchronous: let a running background
-		// sweep end first, it needs the collector lock to finish.
-		gSweeper.waitIdle();
+		/**
+		 * An explicit collection is synchronous: let a running background
+		 * sweep end first, it needs the collector lock to finish, so we
+		 * cannot wait for it with the lock held. Another thread may start
+		 * a collection, and hand its sweep over, between the wait and the
+		 * lock: a sweep is only handed over with the lock held, so look
+		 * again once we have it, and go back to waiting if there is one.
+		 */
+		while (true) {
+			gSweeper.waitIdle();
 
-		gCollectorState.mutex.lock();
+			gCollectorState.mutex.lock();
+			if (!gSweeper.isActive) {
+				break;
+			}
+
+			gCollectorState.mutex.unlock();
+		}
+
 		scope(exit) gCollectorState.mutex.unlock();
 
 		CollectionInfo info;
