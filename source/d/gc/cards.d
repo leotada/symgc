@@ -34,9 +34,16 @@ enum TableSize = size_t(1) << (47 - CardShift);
  */
 extern(C) __gshared ubyte* __sd_gc_card_base;
 
-// Mapped before any code that stores a pointer runs, not lazily.
-pragma(crt_constructor)
+/**
+ * Mapped before any code that stores a pointer runs, not lazily. The
+ * constructors of the program run in no defined order, so this goes in
+ * `.preinit_array`, which the dynamic loader runs before all of them.
+ */
 extern(C) void __sd_gc_card_init() {
+	if (__sd_gc_card_base !is null) {
+		return;
+	}
+
 	enum MAP_NORESERVE = 0x4000; // Linux
 	enum Flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
 	auto p = mmap(null, TableSize, PROT_READ | PROT_WRITE, Flags, -1, 0);
@@ -142,4 +149,10 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
  */
 void clearCards(size_t start, size_t size) {
 	collectCards(start, size, null);
+}
+
+version(LDC) {
+	import ldc.attributes : section;
+
+	@section(".preinit_array") __gshared extern(C) void function() __sd_gc_card_preinit = &__sd_gc_card_init;
 }

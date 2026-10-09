@@ -282,7 +282,23 @@ public:
 	 */
 	@property
 	void sweepTag(uint tag) {
-		_sweepTag = (_sweepTag & ~size_t(uint.max)) | tag;
+		/**
+		 * The flag bits above the epoch are set by the threads that
+		 * allocate from the slab, without a lock (`setHasFinalizers`), so
+		 * the epoch is replaced with a compare and swap: a plain
+		 * read-modify-write loses a flag set in between, and with it the
+		 * finalizers of that slab (run too late, after their partners'
+		 * slots were reused).
+		 */
+		import core.atomic : atomicLoad, cas;
+		auto p = cast(shared(size_t)*) &_sweepTag;
+		while (true) {
+			auto old = atomicLoad(*p);
+			auto n = (old & ~size_t(uint.max)) | tag;
+			if (cas(p, old, n)) {
+				break;
+			}
+		}
 	}
 
 	/**
