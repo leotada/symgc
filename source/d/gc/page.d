@@ -410,14 +410,20 @@ public:
 			self.beginPrepareImpl(gcCycle);
 		}
 
+		// Paced like the sweep: flat out, the prepare of a big heap slows
+		// the thread that allocates for as long as it takes.
+		ulong owed = 0;
 		while (true) {
 			bool more;
+			ulong spent;
 
 			{
 				mutex.lock();
 				scope(exit) mutex.unlockFairly();
 
+				auto tStep = getMonotonicTime();
 				more = self.prepareStepImpl(emap);
+				spent = getMonotonicTime() - tStep;
 			}
 
 			if (!more) {
@@ -428,6 +434,8 @@ public:
 			for (uint i = 0; mutex.hasContenders && i < 64; i++) {
 				sched_yield();
 			}
+
+			owed = paceSweeper(owed, spent);
 		}
 	}
 

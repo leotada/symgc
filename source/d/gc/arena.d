@@ -300,9 +300,25 @@ package:
 	/**
 	 * `clearBinsForCollection` when `lockBins` is held.
 	 */
-	void clearLockedBins() shared {
+	ulong[(BinCount + 63) / 64] clearLockedBins() shared {
+		ulong[(BinCount + 63) / 64] active;
 		foreach (i; 0 .. BinCount) {
-			bins[i].clearLocked();
+			if (bins[i].clearLocked()) {
+				active[i / 64] |= ulong(1) << (i % 64);
+			}
+		}
+
+		return active;
+	}
+
+	/**
+	 * Give the bins that were in use a fresh slab each (see `Bin.prewarm`).
+	 */
+	void prewarmBins(ref CachedExtentMap emap, ref const ulong[(BinCount + 63) / 64] active) shared {
+		foreach (i; 0 .. BinCount) {
+			if ((active[i / 64] >> (i % 64)) & 1) {
+				bins[i].prewarm(&filler, emap, cast(ubyte) i);
+			}
 		}
 	}
 

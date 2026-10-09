@@ -704,6 +704,8 @@ private:
 		 * release a lock somebody else holds.
 		 */
 		shared(Arena)*[ArenaCount] locked;
+		import d.gc.sizeclass : BinCount;
+		ulong[(BinCount + 63) / 64][ArenaCount] active;
 		uint count = 0;
 
 		foreach (i; 0 .. ArenaCount) {
@@ -716,12 +718,17 @@ private:
 
 		startEpoch();
 
-		foreach (a; locked[0 .. count]) {
-			a.clearLockedBins();
+		foreach (i, a; locked[0 .. count]) {
+			active[i] = a.clearLockedBins();
 		}
 
 		foreach_reverse (a; locked[0 .. count]) {
 			a.unlockBins();
+		}
+
+		// The program is about to ask for a slab per size class it uses.
+		foreach (i, a; locked[0 .. count]) {
+			a.prewarmBins(emap, active[i]);
 		}
 	}
 

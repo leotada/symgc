@@ -232,10 +232,39 @@ package:
 		(cast(PriorityExtentHeap*) &slabs).clear();
 	}
 
-	void clearLocked() shared {
+	bool clearLocked() shared {
 		assert(mutex.isHeld(), "Mutex not held!");
 
-		(cast(PriorityExtentHeap*) &slabs).clear();
+		auto heap = cast(PriorityExtentHeap*) &slabs;
+		auto wasActive = !heap.empty;
+		heap.clear();
+		return wasActive;
+	}
+
+	/**
+	 * Put a fresh slab in the bin before the program asks for one. A
+	 * collection that starts empties the bins, and the program would then
+	 * have to make a slab for each size class it uses, all in its next
+	 * frame. Called by the collector thread, with the epoch started: the slab
+	 * is born in it, like any slab made from now on.
+	 */
+	void prewarm(shared(PageFiller)* filler, ref CachedExtentMap emap, ubyte sizeClass) shared {
+		auto fresh = filler.allocSlab(emap, sizeClass);
+		if (fresh is null) {
+			return;
+		}
+
+		import d.gc.extent : gSweepCycle;
+		auto epoch = gSweepCycle.load();
+
+		mutex.lock();
+		scope(exit) mutex.unlock();
+
+		if (epoch != 0 && fresh.sweepTag != epoch) {
+			fresh.sweepTag = epoch;
+		}
+
+		(cast(PriorityExtentHeap*) &slabs).insert(fresh);
 	}
 
 	void combineAfterCollection(ref PriorityExtentHeap cSlabs) shared {
