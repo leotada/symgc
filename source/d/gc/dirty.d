@@ -34,10 +34,61 @@ version(linux) version(X86_64) {
 alias DirtyRangeDg = void delegate(const(void)* start, size_t size);
 
 /**
+ * With `Symgc_cards`, the ranges to look at are the ones that hold pointers;
+ * the cards themselves are in d.gc.cards.
+ */
+version(Symgc_cards) {
+	enum MaxCardRanges = 4096;
+
+	struct CardRanges {
+		Mutex mutex;
+		size_t count;
+		size_t[MaxCardRanges] starts;
+		size_t[MaxCardRanges] sizes;
+
+	shared:
+		bool available() {
+			import core.stdc.stdlib : getenv;
+			auto env = getenv("SYMGC_CONCURRENT_MARK");
+			return env is null || env[0] != '0';
+		}
+
+		void register(void* start, size_t size) {
+			mutex.lock();
+			scope(exit) mutex.unlock();
+
+			auto t = cast(CardRanges*) &this;
+			assert(t.count < MaxCardRanges, "Too many pointer regions!");
+			t.starts[t.count] = cast(size_t) start;
+			t.sizes[t.count] = size;
+			t.count++;
+		}
+
+		size_t collect(scope DirtyRangeDg dg) {
+			mutex.lock();
+			scope(exit) mutex.unlock();
+
+			import d.gc.cards;
+			auto t = cast(CardRanges*) &this;
+			size_t pages = 0;
+			foreach (i; 0 .. t.count) {
+				pages += collectCards(t.starts[i], t.sizes[i], dg);
+			}
+
+			return pages;
+		}
+	}
+
+	shared CardRanges gCardRanges;
+}
+
+/**
  * Is tracking available? Decided once, on the first call.
  */
 bool dirtyAvailable() {
-	version(DirtyTracking) {
+	version(Symgc_cards) {
+		return gCardRanges.available();
+	} else version(DirtyTracking) {
 		return gDirty.ensureInit();
 	} else {
 		return false;
@@ -50,7 +101,9 @@ bool dirtyAvailable() {
  * tracking is turned off for good: a mark that missed a range would be unsound.
  */
 void dirtyRegister(void* start, size_t size) {
-	version(DirtyTracking) {
+	version(Symgc_cards) {
+		gCardRanges.register(start, size);
+	} else version(DirtyTracking) {
 		gDirty.register(start, size);
 	}
 }
@@ -61,7 +114,9 @@ void dirtyRegister(void* start, size_t size) {
  * larger, so arming is an optimization and never needed for correctness.
  */
 void dirtyArm() {
-	version(DirtyTracking) {
+	version(Symgc_cards) {
+		gCardRanges.collect(null);
+	} else version(DirtyTracking) {
 		gDirty.collect(null);
 	}
 }
@@ -72,7 +127,9 @@ void dirtyArm() {
  * of pages reported.
  */
 size_t dirtyCollect(scope DirtyRangeDg dg) {
-	version(DirtyTracking) {
+	version(Symgc_cards) {
+		return gCardRanges.collect(dg);
+	} else version(DirtyTracking) {
 		return gDirty.collect(dg);
 	} else {
 		return 0;
