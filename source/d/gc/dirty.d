@@ -211,12 +211,20 @@ bool initImpl(DirtyTracker* t) {
 
 	t.tried = true;
 
-	// Only when asked for, for now: SYMGC_CONCURRENT_MARK=1. SYMGC_DIRTY=0
-	// turns the tracking off even then.
+	// On by default when the kernel supports it. SYMGC_CONCURRENT_MARK=0 or
+	// SYMGC_DIRTY=0 turns it off (a stop-the-world mark).
 	import core.stdc.stdlib : getenv;
 	auto want = getenv("SYMGC_CONCURRENT_MARK");
-	if (!t.forced && (want is null || want[0] != '1')) {
+	if (!t.forced && want !is null && want[0] == '0') {
 		return false;
+	}
+
+	// The unit tests drive the collector from threads druntime does not know,
+	// so a background mark has nothing to stop: they ask for it explicitly.
+	version(Symgc_testing) {
+		if (!t.forced && (want is null || want[0] != '1')) {
+			return false;
+		}
 	}
 
 	auto env = getenv("SYMGC_DIRTY");
