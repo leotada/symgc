@@ -25,6 +25,13 @@ import core.atomic;
 enum CardShift = 9;
 enum CardSize = size_t(1) << CardShift;
 
+// One summary byte per 64 KiB (128 cards): set with each card, it lets the
+// collector skip the 64 KiB regions with nothing dirty without reading their
+// cards, which is what keeps the pause small for a heap of many GiB.
+enum SummaryShift = 16;
+enum CardsPerSummary = size_t(1) << (SummaryShift - CardShift);
+enum SummarySize = size_t(1) << (47 - SummaryShift);
+
 // The whole user address space: 2^47 bytes of addresses, one byte per card.
 enum TableSize = size_t(1) << (47 - CardShift);
 
@@ -33,6 +40,7 @@ enum TableSize = size_t(1) << (47 - CardShift);
  * with `address >> CardShift`.
  */
 extern(C) __gshared ubyte* __sd_gc_card_base;
+extern(C) __gshared ubyte* __sd_gc_card_summary_base;
 
 /**
  * Mapped before any code that stores a pointer runs, not lazily. The
@@ -43,6 +51,17 @@ extern(C) void __sd_gc_card_init() {
 	if (__sd_gc_card_base !is null) {
 		return;
 	}
+
+	enum NoReserve = 0x4000; // MAP_NORESERVE on Linux
+	auto q = mmap(null, SummarySize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | NoReserve, -1, 0);
+	if (q is MAP_FAILED) {
+		import core.stdc.stdio : fputs, stderr;
+		import core.stdc.stdlib : abort;
+		fputs("symgc: cannot map the card summary\n", stderr);
+		abort();
+	}
+
+	__sd_gc_card_summary_base = cast(ubyte*) q;
 
 	enum MAP_NORESERVE = 0x4000; // Linux
 	enum Flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
@@ -69,6 +88,7 @@ extern(C) void __sd_gc_card_range(void* dst, size_t size) {
 	auto first = cast(size_t) dst >> CardShift;
 	auto last = (cast(size_t) dst + size - 1) >> CardShift;
 	__sd_gc_card_base[first .. last + 1] = 1;
+	__sd_gc_card_summary_base[(first >> (SummaryShift - CardShift)) .. (last >> (SummaryShift - CardShift)) + 1] = 1;
 }
 
 /**
@@ -110,34 +130,59 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
 		runHi = s + PageSize;
 	}
 
-	// Eight cards at a time: an exchange of the whole word is atomic against
-	// the byte stores of the program, so a card set after it is seen next time.
-	size_t i = lo;
-	while (i < hi) {
-		if ((i & 7) == 0 && i + 8 <= hi) {
-			auto w = cast(shared(ulong)*) (base + i);
-			if (atomicLoad!(MemoryOrder.raw)(*w) == 0) {
+	// The summary says which 64 KiB regions have a dirty card. It is read and
+	// cleared first, so a card set meanwhile sets its summary again.
+	auto sbase = __sd_gc_card_summary_base;
+	auto slo = lo >> (SummaryShift - CardShift);
+	auto shi = (hi + CardsPerSummary - 1) >> (SummaryShift - CardShift);
+
+	foreach (si; slo .. shi) {
+		auto sb = cast(shared(ubyte)*) (sbase + si);
+		if (atomicLoad!(MemoryOrder.raw)(*sb) == 0) {
+			continue;
+		}
+
+		atomicStore!(MemoryOrder.rel)(*sb, ubyte(0));
+
+		auto from = si << (SummaryShift - CardShift);
+		auto to = from + CardsPerSummary;
+		if (from < lo) {
+			from = lo;
+		}
+		if (to > hi) {
+			to = hi;
+		}
+
+		// Eight cards at a time: an exchange of the whole word is atomic
+		// against the byte stores of the program, so a card set after it
+		// is seen next time.
+		size_t i = from;
+		while (i < to) {
+			if ((i & 7) == 0 && i + 8 <= to) {
+				auto w = cast(shared(ulong)*) (base + i);
+				if (atomicLoad!(MemoryOrder.raw)(*w) == 0) {
+					i += 8;
+					continue;
+				}
+
+				auto v = atomicExchange!(MemoryOrder.acq_rel)(w, 0UL);
+				foreach (j; 0 .. 8) {
+					if ((v >> (8 * j)) & 0xff) {
+						page((i + j) / CardsPerPage);
+					}
+				}
+
 				i += 8;
 				continue;
 			}
 
-			auto v = atomicExchange!(MemoryOrder.acq_rel)(w, 0UL);
-			foreach (j; 0 .. 8) {
-				if ((v >> (8 * j)) & 0xff) {
-					page((i + j) / CardsPerPage);
-				}
+			auto b = cast(shared(ubyte)*) (base + i);
+			if (atomicExchange!(MemoryOrder.acq_rel)(b, ubyte(0))) {
+				page(i / CardsPerPage);
 			}
 
-			i += 8;
-			continue;
+			i++;
 		}
-
-		auto b = cast(shared(ubyte)*) (base + i);
-		if (atomicExchange!(MemoryOrder.acq_rel)(b, ubyte(0))) {
-			page(i / CardsPerPage);
-		}
-
-		i++;
 	}
 
 	flush();
