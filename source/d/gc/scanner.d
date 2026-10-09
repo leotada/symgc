@@ -411,6 +411,17 @@ public:
 			import d.gc.gctime;
 			markGcThread();
 
+			// Background work, like the sweeper: when it shares a core with a
+			// mutator, the mutator comes first. A nice value applies to the
+			// calling thread only on Linux.
+			version(linux) {
+				import core.stdc.stdlib : getenv, atoi;
+				import core.sys.posix.sys.resource : setpriority, PRIO_PROCESS;
+				if (auto env = getenv("SYMGC_MARK_NICE")) {
+					setpriority(PRIO_PROCESS, 0, atoi(env));
+				}
+			}
+
 			// Set a flag saying we should not be using our local thread cache.
 			// The only allocations/free we should be doing is to resize the work list.
 			// Note that scanning threads DO NOT have their stack or TLS scanned,

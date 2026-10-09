@@ -64,6 +64,9 @@ private:
 	import d.sync.mutex;
 	shared Mutex mutex;
 
+	// Who held the lock last, see `gHolderCount`.
+	version(Symgc_lock_hist) shared ubyte lastHolder;
+
 	/**
 	 * We separate dense from sparse allocations.
 	 *
@@ -332,6 +335,11 @@ public:
 			auto lockTimer = GcTimer.begin(GcTimeKind.FillerLock);
 			mutex.lock();
 			lockTimer.end();
+			version(Symgc_lock_hist) {
+				import d.gc.time;
+				holderHist(lastHolder, getMonotonicTime() - lockTimer.start);
+				lastHolder = 1;
+			}
 		}
 
 		scope(exit) mutex.unlock();
@@ -350,6 +358,11 @@ public:
 			auto lockTimer = GcTimer.begin(GcTimeKind.FillerLock);
 			mutex.lock();
 			lockTimer.end();
+			version(Symgc_lock_hist) {
+				import d.gc.time;
+				holderHist(lastHolder, getMonotonicTime() - lockTimer.start);
+				lastHolder = 1;
+			}
 		}
 
 		scope(exit) mutex.unlock();
@@ -381,6 +394,7 @@ public:
 		// Free the pages.
 		mutex.lock();
 		scope(exit) mutex.unlock();
+		version(Symgc_lock_hist) lastHolder = 2;
 
 		foreach (e; extents) {
 			(cast(PageFiller*) &this).freePagesImpl(e);
@@ -396,6 +410,7 @@ public:
 
 		mutex.lock();
 		scope(exit) mutex.unlock();
+		version(Symgc_lock_hist) lastHolder = 2;
 
 		(cast(PageFiller*) &this).freePagesImpl(e, n, pages);
 	}
@@ -436,6 +451,7 @@ public:
 			{
 				mutex.lock();
 				scope(exit) mutex.unlockFairly();
+				version(Symgc_lock_hist) lastHolder = 3;
 
 				auto tStep = getMonotonicTime();
 				more = self.prepareStepImpl(emap);
@@ -494,6 +510,7 @@ public:
 			{
 				mutex.lock();
 				scope(exit) mutex.unlockFairly();
+				version(Symgc_lock_hist) lastHolder = 4;
 
 				if (self.sweepPhase != SweepPhase.DenseFinalize
 					    && self.sweepPhase != SweepPhase.SparseFinalize) {
@@ -541,6 +558,7 @@ public:
 			{
 				mutex.lock();
 				scope(exit) mutex.unlockFairly();
+				version(Symgc_lock_hist) lastHolder = 5;
 
 				auto tStep = getMonotonicTime();
 				more = self.sweepStep(emap, gcCycle, self.sweepStats);
@@ -623,9 +641,20 @@ private:
 	                     ref bool dirty) {
 		assert(mutex.isHeld(), "Mutex not held!");
 
+		version(Symgc_lock_hist) {
+			import d.gc.time, d.gc.gctime;
+			auto t0 = getMonotonicTime();
+			scope(exit) segHist(0, getMonotonicTime() - t0);
+		}
+
 		auto e = getOrAllocateExtent();
 		if (unlikely(e is null)) {
 			return null;
+		}
+
+		version(Symgc_lock_hist) {
+			auto t1 = getMonotonicTime();
+			segHist(1, t1 - t0);
 		}
 
 		auto block = extractBlock(pages, mask, ec.dense);
@@ -634,8 +663,15 @@ private:
 			return null;
 		}
 
+		version(Symgc_lock_hist) {
+			auto t2 = getMonotonicTime();
+			segHist(2, t2 - t1);
+		}
+
 		auto n = block.reserve(pages, dirty);
 		registerBlock(block);
+
+		version(Symgc_lock_hist) segHist(4, getMonotonicTime() - t2);
 
 		usedPageCount.fetchAdd(pages);
 
@@ -971,6 +1007,12 @@ private:
 		assert(mutex.isHeld(), "Mutex not held!");
 		assert(!Dense || extraBlocks == 0, "Huge allocations cannot be dense!");
 
+		version(Symgc_lock_hist) {
+			import d.gc.time, d.gc.gctime;
+			auto tAcq = getMonotonicTime();
+			scope(exit) segHist(3, getMonotonicTime() - tAcq);
+		}
+
 		if (!refillBlockDescriptors()) {
 			return null;
 		}
@@ -1291,6 +1333,7 @@ private:
 
 		mutex.lock();
 		scope(exit) mutex.unlockFairly();
+		version(Symgc_lock_hist) lastHolder = 6;
 
 		if (self.sweepPhase == SweepPhase.Idle) {
 			return AssistResult.Done;

@@ -62,7 +62,98 @@ struct GcTimer {
 		import d.gc.time;
 		auto elapsed = getMonotonicTime() - start;
 		auto inner = tGcTimeSum - innerAtStart;
+		version(Symgc_lock_hist) {
+			if (!tIsGcThread) {
+				lockHist(kind, elapsed);
+			}
+		}
+
 		record(kind, elapsed > inner ? elapsed - inner : 0);
+	}
+}
+
+version(Symgc_lock_hist) {
+	// Count and total of the waits of each kind, by power of two of 100 ns.
+	shared ulong[24][GcTimeKindCount] gHistCount;
+	shared ulong[24][GcTimeKindCount] gHistTime;
+
+	void lockHist(GcTimeKind kind, ulong hnsecs) {
+		import core.atomic : atomicOp;
+		uint b = 0;
+		while (b < 23 && (hnsecs >> b) > 1) {
+			b++;
+		}
+
+		atomicOp!"+="(gHistCount[kind][b], 1);
+		atomicOp!"+="(gHistTime[kind][b], hnsecs);
+	}
+
+	// Waits for the page filler's lock by who held it before: 0 other,
+	// 1 allocation, 2 free, 3 prepare, 4 finalizer sweep, 5 sweep, 6 assist.
+	shared ulong[24][8] gHolderCount;
+	shared ulong[24][8] gHolderTime;
+
+	void holderHist(ubyte holder, ulong hnsecs) {
+		if (tIsGcThread) {
+			return;
+		}
+
+		import core.atomic : atomicOp;
+		uint b = 0;
+		while (b < 23 && (hnsecs >> b) > 1) {
+			b++;
+		}
+
+		atomicOp!"+="(gHolderCount[holder][b], 1);
+		atomicOp!"+="(gHolderTime[holder][b], hnsecs);
+	}
+
+	// How long the page filler's lock is held in the parts of an allocation:
+	// 0 the whole hold, 1 getting an extent, 2 getting a block (heaps),
+	// 3 acquiring a new block (region), 4 reserving the pages.
+	shared ulong[24][8] gSegCount;
+	shared ulong[24][8] gSegTime;
+
+	void segHist(uint seg, ulong hnsecs) {
+		if (tIsGcThread) {
+			return;
+		}
+
+		import core.atomic : atomicOp;
+		uint b = 0;
+		while (b < 23 && (hnsecs >> b) > 1) {
+			b++;
+		}
+
+		atomicOp!"+="(gSegCount[seg][b], 1);
+		atomicOp!"+="(gSegTime[seg][b], hnsecs);
+	}
+
+	extern(C) void __sd_gc_seg_hist(ulong* count, ulong* time) {
+		foreach (h; 0 .. 8) {
+			foreach (b; 0 .. 24) {
+				count[h * 24 + b] = gSegCount[h][b];
+				time[h * 24 + b] = gSegTime[h][b] * 100;
+			}
+		}
+	}
+
+	extern(C) void __sd_gc_holder_hist(ulong* count, ulong* time) {
+		foreach (h; 0 .. 8) {
+			foreach (b; 0 .. 24) {
+				count[h * 24 + b] = gHolderCount[h][b];
+				time[h * 24 + b] = gHolderTime[h][b] * 100;
+			}
+		}
+	}
+
+	extern(C) void __sd_gc_lock_hist(ulong* count, ulong* time) {
+		foreach (k; 0 .. GcTimeKindCount) {
+			foreach (b; 0 .. 24) {
+				count[k * 24 + b] = gHistCount[k][b];
+				time[k * 24 + b] = gHistTime[k][b] * 100;
+			}
+		}
 	}
 }
 
