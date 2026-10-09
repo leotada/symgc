@@ -339,8 +339,30 @@ public:
 			return;
 		}
 
-		auto pd = getPageDescriptor(ptr);
+		// Like the other collectors, ignore what we did not hand out: a
+		// pointer to the stack, to malloc'd memory, or into the middle of a
+		// block.
+		auto pd = maybeGetPageDescriptor(ptr);
+		if (!isBlockStart(pd, ptr)) {
+			return;
+		}
+
 		free(pd, ptr);
+	}
+
+	/**
+	 * Whether `ptr` is the first byte of an allocation of ours.
+	 */
+	bool isBlockStart(PageDescriptor pd, const void* ptr) {
+		if (pd.extent is null) {
+			return false;
+		}
+
+		if (pd.isSlab()) {
+			return SlabAllocInfo(pd, ptr).address is ptr;
+		}
+
+		return ptr is pd.extent.address;
 	}
 
 	void free(PageDescriptor pd, void* ptr) {
@@ -420,8 +442,14 @@ public:
 			return alloc(size, containsPointers, false);
 		}
 
+		// Not ours, or not the start of a block: the other collectors
+		// refuse these, and so do we.
+		auto pd = maybeGetPageDescriptor(ptr);
+		if (!isBlockStart(pd, ptr)) {
+			return null;
+		}
+
 		auto copySize = size;
-		auto pd = getPageDescriptor(ptr);
 
 		auto ec = pd.extentClass;
 		auto samePointerness = containsPointers == pd.containsPointers;
