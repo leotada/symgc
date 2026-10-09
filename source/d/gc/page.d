@@ -50,6 +50,14 @@ __gshared size_t gSweepHardLimit = size_t.max;
  */
 __gshared size_t gSweepRetainPages = 0;
 
+/**
+ * Counts the extents freed, in all arenas. A thread that remembers where an
+ * array lives (see `ThreadCache.resize`) knows it is stale when this changed:
+ * freed pages may come back as a slab of another size class.
+ */
+import d.sync.atomic : Atomic;
+shared Atomic!uint gSlabFreeEpoch;
+
 struct PageFiller {
 private:
 	@property package
@@ -733,6 +741,9 @@ private:
 		assert(mutex.isHeld(), "Mutex not held!");
 		assert(pages > 0 && pages <= PagesInBlock, "Invalid number of pages!");
 		assert(n <= PagesInBlock - pages, "Invalid index!");
+
+		// Before the pages can be handed out again.
+		gSlabFreeEpoch.fetchAdd(1);
 
 		auto block = e.block;
 		unregisterBlock(block);

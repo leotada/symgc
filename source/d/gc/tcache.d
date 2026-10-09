@@ -33,6 +33,20 @@ private:
 	size_t deallocated;
 	size_t nextDeallocationEvent;
 
+	/**
+	 * The slot of the last array this thread appended to, so that appending
+	 * again skips the extent map lookup and the work to find the slot's
+	 * index. It is good as long as no slab or extent was freed anywhere
+	 * since: `appendEpoch` is `gSlabFreeEpoch` at the lookup.
+	 */
+	const(void)* appendBase;
+	const(void)* appendEnd;
+	import d.gc.extent : Extent;
+	Extent* appendExtent;
+	uint appendIndex;
+	uint appendSlotSize;
+	uint appendEpoch;
+
 	package CachedExtentMap emap;
 
 	/**
@@ -923,6 +937,18 @@ private:
 			return true;
 		}
 
+		import d.gc.page : gSlabFreeEpoch;
+		import d.sync.atomic : MemoryOrder;
+		auto epoch = gSlabFreeEpoch.load!(MemoryOrder.Relaxed)();
+
+		// Appending to the slot we appended to last.
+		if (slice.ptr >= appendBase && slice.ptr < appendEnd
+			    && appendEpoch == epoch) {
+			auto si = SlabAllocInfo(appendExtent, appendIndex, appendSlotSize,
+			                        cast(void*) appendBase);
+			return resizeSlab!AdjustUsedCapacity(si, slice, size);
+		}
+
 		auto pd = maybeGetPageDescriptor(slice.ptr);
 		auto e = pd.extent;
 		if (e is null) {
@@ -931,18 +957,16 @@ private:
 
 		if (pd.isSlab()) {
 			auto si = SlabAllocInfo(pd, slice.ptr);
-			auto usedCapacity = si.usedCapacity;
-
-			if (!validateCapacity(slice, si.address, usedCapacity)) {
-				return false;
+			if (si.metadataSupported) {
+				appendBase = si.address;
+				appendEnd = si.address + si.slotBytes;
+				appendExtent = si.slabExtent;
+				appendIndex = si.slotIndex;
+				appendSlotSize = si.slotBytes;
+				appendEpoch = epoch;
 			}
 
-			auto newCapacity = usedCapacity + size;
-			if (AdjustUsedCapacity) {
-				return si.setUsedCapacity(newCapacity);
-			}
-
-			return newCapacity <= si.slotCapacity;
+			return resizeSlab!AdjustUsedCapacity(si, slice, size);
 		}
 
 		auto usedCapacity = e.usedCapacity;
@@ -967,6 +991,22 @@ private:
 		}
 
 		return true;
+	}
+
+	bool resizeSlab(bool AdjustUsedCapacity)(ref SlabAllocInfo si,
+	                                         const void[] slice, size_t size) {
+		auto usedCapacity = si.usedCapacity;
+
+		if (!validateCapacity(slice, si.address, usedCapacity)) {
+			return false;
+		}
+
+		auto newCapacity = usedCapacity + size;
+		if (AdjustUsedCapacity) {
+			return si.setUsedCapacity(newCapacity);
+		}
+
+		return newCapacity <= si.slotCapacity;
 	}
 
 	bool growLarge(PageDescriptor pd, uint npages) {

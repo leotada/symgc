@@ -177,6 +177,40 @@ public:
 		_hasMetadata = ec.supportsMetadata && e.hasMetadata(index);
 	}
 
+	/**
+	 * For a slot we looked up before, see `ThreadCache.resize`. Whether the
+	 * slot has metadata is read again, it changes with the slot's contents.
+	 */
+	this(Extent* e, uint index, uint slotSize, void* address) {
+		this.e = e;
+		this.index = index;
+		this.slotSize = slotSize;
+		this._address = address;
+
+		supportsMetadata = true;
+		_hasMetadata = e.hasMetadata(index);
+	}
+
+	@property
+	bool metadataSupported() {
+		return supportsMetadata;
+	}
+
+	@property
+	Extent* slabExtent() {
+		return e;
+	}
+
+	@property
+	uint slotIndex() {
+		return index;
+	}
+
+	@property
+	uint slotBytes() {
+		return slotSize;
+	}
+
 	@property
 	auto hasMetadata() {
 		return _hasMetadata;
