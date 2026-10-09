@@ -327,7 +327,13 @@ public:
 
 		auto mask = uint.max << allocClass;
 
-		mutex.lock();
+		{
+			import d.gc.gctime;
+			auto lockTimer = GcTimer.begin(GcTimeKind.FillerLock);
+			mutex.lock();
+			lockTimer.end();
+		}
+
 		scope(exit) mutex.unlock();
 
 		return (cast(PageFiller*) &this).allocRunImpl(pages, mask, ec, dirty);
@@ -339,7 +345,13 @@ public:
 		uint extraBlocks = (pages - 1) / PagesInBlock;
 		pages = modUp(pages, PagesInBlock);
 
-		mutex.lock();
+		{
+			import d.gc.gctime;
+			auto lockTimer = GcTimer.begin(GcTimeKind.FillerLock);
+			mutex.lock();
+			lockTimer.end();
+		}
+
 		scope(exit) mutex.unlock();
 
 		return (cast(PageFiller*) &this).allocHugeImpl(pages, extraBlocks);

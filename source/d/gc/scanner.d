@@ -408,6 +408,9 @@ public:
 			import d.gc.tcache;
 			threadCache.activateGC(false);
 
+			import d.gc.gctime;
+			markGcThread();
+
 			// Set a flag saying we should not be using our local thread cache.
 			// The only allocations/free we should be doing is to resize the work list.
 			// Note that scanning threads DO NOT have their stack or TLS scanned,

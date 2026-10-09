@@ -1025,6 +1025,9 @@ private:
 				setpriority(PRIO_PROCESS, 0, nice);
 			}
 
+			import d.gc.gctime;
+			markGcThread();
+
 			(cast(shared(Sweeper)*) arg).run();
 		}
 

@@ -9,9 +9,17 @@ module d.gc.gctime;
  *    the sweep (assist);
  *  - Pause: stopped by the collector (start and remark pauses).
  *
+ *  - BinLock, FreshSlab, FillerLock: parts of Alloc, timed on their own to see
+ *    where a refill waits: the bin's lock, getting a new slab from the page
+ *    filler (its work, without its lock wait), and the page filler's lock.
+ *
  * Each timer counts its own time only: whatever an inner timer recorded
  * meanwhile (a pause during a refill, a collection during an allocation) is
- * taken out, so the kinds add up without counting anything twice.
+ * taken out, so the kinds add up without counting anything twice. Alloc is
+ * what is left of a slow path once its parts are taken out.
+ *
+ * Only the program's threads count: the collector's own threads (marking,
+ * sweeping) take the same locks, and that is not time the program lost.
  *
  * Times are in hnsecs internally and reported in nanoseconds.
  */
@@ -19,9 +27,19 @@ enum GcTimeKind : uint {
 	Alloc,
 	Collect,
 	Pause,
+	BinLock,
+	FreshSlab,
+	FillerLock,
 }
 
-enum GcTimeKindCount = 3;
+enum GcTimeKindCount = 6;
+
+/// Set on the collector's own threads: they record nothing.
+bool tIsGcThread;
+
+void markGcThread() {
+	tIsGcThread = true;
+}
 
 /// All threads since the start.
 shared ulong[GcTimeKindCount] gGcTimeTotal;
@@ -49,6 +67,10 @@ struct GcTimer {
 }
 
 void record(GcTimeKind kind, ulong hnsecs) {
+	if (tIsGcThread) {
+		return;
+	}
+
 	tGcTime[kind] += hnsecs;
 	tGcTimeSum += hnsecs;
 

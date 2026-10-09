@@ -94,11 +94,13 @@ uint __sd_gc_disable() {
 }
 
 /**
- * Time lost to memory management, in nanoseconds: `dst[0]` the allocator's
- * slow paths, `dst[1]` starting or helping a collection, `dst[2]` stopped by
- * the collector. For the calling thread since it started, or for all threads
- * since the program started. Read it before and after a frame for the
- * collector's share of that frame.
+ * Time lost to memory management, in nanoseconds, six values: `dst[0]` the
+ * allocator's slow paths, `dst[1]` starting or helping a collection, `dst[2]`
+ * stopped by the collector, and three parts of the slow paths, not counted in
+ * `dst[0]`: `dst[3]` waiting for a bin's lock, `dst[4]` getting a new slab,
+ * `dst[5]` waiting for the page filler's lock. For the calling thread since it
+ * started, or for all the program's threads since it started. Read it before
+ * and after a frame for the collector's share of that frame.
  */
 void __sd_gc_time_thread(ulong* dst) {
 	import d.gc.gctime;

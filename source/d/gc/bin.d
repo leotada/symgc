@@ -62,7 +62,13 @@ struct Bin {
 		auto insert = bottom;
 
 		Refill: {
-			mutex.lock();
+			{
+				import d.gc.gctime;
+				auto lockTimer = GcTimer.begin(GcTimeKind.BinLock);
+				mutex.lock();
+				lockTimer.end();
+			}
+
 			scope(exit) mutex.unlock();
 
 			auto slabs = &(cast(Bin*) &this).slabs;
@@ -140,7 +146,13 @@ struct Bin {
 			return insert;
 		}
 
-		freshSlab = filler.allocSlab(emap, sizeClass);
+		{
+			import d.gc.gctime;
+			auto slabTimer = GcTimer.begin(GcTimeKind.FreshSlab);
+			freshSlab = filler.allocSlab(emap, sizeClass);
+			slabTimer.end();
+		}
+
 		assert(freshSlab is null || freshSlab.nfree == nslots);
 
 		progressed = false;
