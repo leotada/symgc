@@ -237,9 +237,15 @@ private:
 	alias Leaf = ExtentMapTree.Leaf;
 
 public:
+	/**
+	 * A block with no leaf has no page in the map yet, or ever: the pages
+	 * the collector takes for its own use (bitmaps) are not mapped, and a
+	 * block that holds nothing else is never mapped at all. Every page of
+	 * it reads as having no extent, which the sweep skips like an
+	 * allocation in flight.
+	 */
 	this(void* block, shared(Leaf)* leaf) {
 		assert(isAligned(block, BlockSize), "Invalid block address!");
-		assert(leaf !is null, "Unmapped block!");
 
 		this.block = block;
 		this.leaves = cast(shared(Leaf[PagesInBlock])*) leaf;
@@ -247,7 +253,7 @@ public:
 
 	auto lookup(uint index) {
 		assert(index < PagesInBlock, "Invalid index!");
-		return (*leaves)[index].load();
+		return leaves is null ? PageDescriptor(0) : (*leaves)[index].load();
 	}
 }
 
