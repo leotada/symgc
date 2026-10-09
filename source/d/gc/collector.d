@@ -193,6 +193,37 @@ struct Collector {
 
 		CollectionInfo info;
 		runGCCycleLocked(info, false);
+		(cast(CollectorState*) &gCollectorState).recordProfile(info);
+	}
+
+	/**
+	 * `GC.runFinalizers`: run the finalizers that lie in `segment`. Like an
+	 * explicit collection, with no sweep running and none starting.
+	 */
+	void runFinalizers(const(void)[] segment) {
+		while (true) {
+			gSweeper.waitIdle();
+
+			gCollectorState.mutex.lock();
+			if (!gSweeper.isActive) {
+				break;
+			}
+
+			gCollectorState.mutex.unlock();
+		}
+
+		scope(exit) gCollectorState.mutex.unlock();
+
+		// Finalizers run as in a sweep: they may not allocate.
+		threadCache.startCollection();
+		scope(exit) threadCache.endCollection();
+
+		foreach (i; 0 .. ArenaCount) {
+			auto a = Arena.getIfInitialized(i);
+			if (a !is null) {
+				a.runFinalizersInSegment(emap, segment);
+			}
+		}
 	}
 
 private:
@@ -887,6 +918,23 @@ CollectionInfo lastCollectionInfo() {
 }
 
 /**
+ * The totals of all the cycles since the start, five values: the number of
+ * collections, the time spent collecting, the time threads were paused, and
+ * the longest pause and collection (100 ns).
+ */
+void profileStats(ulong* dst) {
+	gCollectorState.mutex.lock();
+	scope(exit) gCollectorState.mutex.unlock();
+
+	auto s = cast(CollectorState*) &gCollectorState;
+	dst[0] = s.numCollections;
+	dst[1] = s.totalCollectionTime;
+	dst[2] = s.totalPauseTime;
+	dst[3] = s.maxPauseTime;
+	dst[4] = s.maxCollectionTime;
+}
+
+/**
  * Stop the background sweeper thread, if there is one. Called when the GC
  * is torn down.
  */
@@ -1123,6 +1171,13 @@ private:
 	 */
 	ulong amortizedDuration;
 
+	// What GC.profileStats reports.
+	ulong numCollections;
+	ulong totalCollectionTime;
+	ulong totalPauseTime;
+	ulong maxPauseTime;
+	ulong maxCollectionTime;
+
 	size_t amortizedHeapSize = DefaultMinHeapSize;
 	size_t peakHeapSize = DefaultMinHeapSize;
 
@@ -1243,6 +1298,7 @@ private:
 		}
 
 		lastCollectionInfo = info;
+		recordProfile(info);
 		updateTargetPageCount();
 	}
 
@@ -1256,7 +1312,21 @@ public:
 
 		auto self = cast(CollectorState*) &this;
 		self.lastCollectionInfo = info;
+		self.recordProfile(info);
 		self.updateTargetPageCount();
+	}
+
+	/**
+	 * Count a finished cycle for `GC.profileStats`; times are in 100 ns.
+	 * Called for every cycle, with the collector lock held.
+	 */
+	void recordProfile(ref CollectionInfo info) {
+		auto duration = info.stop - info.start;
+		numCollections++;
+		totalCollectionTime += duration;
+		totalPauseTime += info.pauseTime;
+		maxPauseTime = max(maxPauseTime, info.pauseTime);
+		maxCollectionTime = max(maxCollectionTime, duration);
 	}
 
 private:

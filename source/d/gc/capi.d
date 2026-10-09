@@ -65,6 +65,25 @@ void __sd_gc_collect() {
 	collector.runGCCycle();
 }
 
+void __sd_gc_run_finalizers(const void[] segment) {
+	import d.gc.collector;
+	auto collector = Collector(&threadCache);
+	collector.runFinalizers(segment);
+}
+
+void __sd_gc_profile_stats(ulong* dst) {
+	import d.gc.collector;
+	profileStats(dst);
+}
+
+bool __sd_gc_set_finalizer_attr(void* ptr, void* finalizer) {
+	return threadCache.setFinalizerAttr(ptr, finalizer);
+}
+
+void __sd_gc_clear_finalizer_attr(void* ptr) {
+	threadCache.clearFinalizerAttr(ptr);
+}
+
 void __sd_gc_add_roots(const void[] range) {
 	import d.gc.global;
 	gState.addRoots(range);

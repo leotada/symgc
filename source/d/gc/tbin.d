@@ -200,6 +200,21 @@ public:
 	}
 
 	/**
+	 * Whether `ptr` is one of the slots in the cache: they are free, whether
+	 * they were never handed out or were freed by the thread.
+	 */
+	bool holds(const void* ptr) {
+		auto end = top;
+		for (auto p = _head; p < end; p++) {
+			if (*p is ptr) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
 	 * This function aids in getting a current amount of data free on the
 	 * Returns: Number of cached allocations
 	 */

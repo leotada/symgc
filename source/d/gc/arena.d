@@ -263,6 +263,10 @@ package:
 		filler.sweepFinalizers(emap, gcCycle);
 	}
 
+	void runFinalizersInSegment(ref CachedExtentMap emap, const(void)[] segment) shared {
+		filler.runFinalizersInSegment(emap, segment);
+	}
+
 	void finishSweep(ref CachedExtentMap emap, ubyte gcCycle, ref CollectStats stats) shared {
 		filler.finishSweep(emap, gcCycle, stats);
 	}

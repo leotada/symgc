@@ -145,6 +145,61 @@ void __sd_gc_finalize(void* ptr, size_t usedSpace, void* finalizer) {
 	}
 }
 
+/**
+ * Finalize a class instance that got its finalizer with `GC.setAttr`, see
+ * `d.gc.late`.
+ */
+void __sd_gc_finalize_late(void* ptr) {
+	version(Symgc_druntime_hooks) {
+		rt_finalize2(ptr, false, false);
+	}
+}
+
+// hooks for GC.runFinalizers, see `PageFiller.runBlockFinalizers`.
+extern(C) int rt_hasFinalizerInSegment(void* p, size_t size, TypeInfo typeInfo,
+                                       scope const(void)[] segment) nothrow;
+extern(C) void rt_finalizeFromGC(void* p, size_t size, uint attr,
+                                 TypeInfo typeInfo) nothrow;
+
+/**
+ * Whether the finalizer of the block (a class destructor, or a struct's) lies
+ * in `segment`. `usedSpace` is the used capacity of the block, with the
+ * padding byte of an appendable block, as for `__sd_gc_finalize`.
+ */
+bool __sd_gc_has_finalizer_in_segment(void* ptr, size_t usedSpace,
+                                      void* finalizer, const(void)[] segment) {
+	version(Symgc_druntime_hooks) {
+		import symgc.gcobj : TYPEINFO_IN_BLOCK;
+		if (finalizer == TYPEINFO_IN_BLOCK) {
+			return rt_hasFinalizerInSegment(ptr, 0, null, segment) != 0;
+		}
+
+		return rt_hasFinalizerInSegment(ptr, usedSpace - 1,
+		                                cast(TypeInfo) finalizer, segment) != 0;
+	} else {
+		return false;
+	}
+}
+
+/**
+ * Finalize the way the other collectors do on `GC.runFinalizers`: an
+ * exception from a struct destructor is turned into a FinalizeError.
+ */
+void __sd_gc_finalize_from_gc(void* ptr, size_t usedSpace, void* finalizer) {
+	version(Symgc_druntime_hooks) {
+		import symgc.gcobj : TYPEINFO_IN_BLOCK;
+		import core.memory : GC;
+		if (finalizer == TYPEINFO_IN_BLOCK) {
+			rt_finalizeFromGC(ptr, 0, 0, null);
+		} else {
+			rt_finalizeFromGC(ptr, usedSpace - 1, GC.BlkAttr.APPENDABLE,
+			                  cast(TypeInfo) finalizer);
+		}
+	} else {
+		__sd_gc_finalize(ptr, usedSpace, finalizer);
+	}
+}
+
 void __sd_gc_register_global_segments() {
 	version(Symgc_druntime_hooks) {
 		// druntime handles this on its own

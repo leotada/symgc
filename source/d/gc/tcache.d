@@ -366,9 +366,30 @@ public:
 	}
 
 	void free(PageDescriptor pd, void* ptr) {
+		/**
+		 * `-version=Symgc_check_free`: stop at the call that frees a slot
+		 * twice (the second free of a slot in a thread's cache, or of a slot
+		 * the slab already got back), where the stack trace tells who frees
+		 * it. Without it the double free shows only when the cache is flushed.
+		 */
+		version(Symgc_check_free) {
+			if (pd.isSlab()) {
+				assert(!isFreeInCache(pd, ptr),
+				       "Double free: the slot is free in this thread's cache!");
+				assert(pd.extent.slabData.valueAt(SlabEntry(pd, ptr).index),
+				       "Double free: the slot is free in its slab!");
+			}
+		}
+
 		shadeReleasedBlock(pd, ptr);
 
 		if (likely(pd.isSlab())) {
+			// A finalizer given after the allocation dies with the slot.
+			if (unlikely(pd.extent.hasFinalizers)) {
+				import d.gc.late;
+				lateRemove(ptr);
+			}
+
 			freeSmall(pd, ptr);
 		} else {
 			freeLarge(pd);
@@ -392,6 +413,12 @@ public:
 
 				import d.gc.hooks;
 				__sd_gc_finalize(ptr, si.usedCapacity, finalizer);
+			} else if (unlikely(e.hasFinalizers)) {
+				// A finalizer given after the allocation, see d.gc.late.
+				import d.gc.late, d.gc.hooks;
+				if (lateRemove(ptr)) {
+					__sd_gc_finalize_late(ptr);
+				}
 			}
 
 			shadeReleasedBlock(pd, ptr);
@@ -405,6 +432,93 @@ public:
 			shadeReleasedBlock(pd, ptr);
 			freeLarge(pd);
 		}
+	}
+
+	/**
+	 * `GC.setAttr(ptr, FINALIZE)`: the block is a class instance to finalize
+	 * when it dies (`finalizer` is what an allocation with FINALIZE stores for
+	 * one). A slab slot has no room for the pointer, so it goes in the table
+	 * of `d.gc.late`. Returns whether the block now has a finalizer.
+	 */
+	bool setFinalizerAttr(void* ptr, void* finalizer) {
+		auto pd = maybeGetPageDescriptor(ptr);
+		if (!isBlockStart(pd, ptr)) {
+			return false;
+		}
+
+		auto e = pd.extent;
+		if (!pd.isSlab()) {
+			if (e.finalizer is null) {
+				e.setFinalizer(finalizer);
+			}
+
+			return true;
+		}
+
+		auto si = SlabAllocInfo(pd, ptr);
+		if (si.finalizer !is null) {
+			return true;
+		}
+
+		if (!pd.extentClass.supportsMetadata) {
+			return false;
+		}
+
+		import d.gc.late;
+		if (!lateAdd(ptr)) {
+			return false;
+		}
+
+		e.setHasFinalizers();
+		return true;
+	}
+
+	/**
+	 * `GC.clrAttr(ptr, FINALIZE)`: the block is not finalized when it dies.
+	 */
+	void clearFinalizerAttr(void* ptr) {
+		auto pd = maybeGetPageDescriptor(ptr);
+		if (!isBlockStart(pd, ptr)) {
+			return;
+		}
+
+		auto e = pd.extent;
+		if (!pd.isSlab()) {
+			e.setFinalizer(null);
+			return;
+		}
+
+		import d.gc.late;
+		if (lateRemove(ptr)) {
+			return;
+		}
+
+		auto si = SlabAllocInfo(pd, ptr);
+		if (si.finalizer !is null) {
+			SlotMetadata.fromBlock(si.address, binInfos[pd.extentClass.sizeClass].slotSize).clearFinalizer();
+		}
+	}
+
+	/**
+	 * Whether the slot is free in this thread's cache: allocated as far as
+	 * the slab knows, but not in use (never handed out, or freed by this
+	 * thread). The slots of other threads' caches cannot be seen from here.
+	 */
+	bool isFreeInCache(PageDescriptor pd, const void* slot) {
+		auto bin = &bins[getBinIndex(pd.extentClass.sizeClass, pd.containsPointers)];
+		return bin.holds(slot);
+	}
+
+	/**
+	 * Whether the block has a finalizer, for `GC.getAttr`.
+	 */
+	bool hasFinalizerAttr(PageDescriptor pd, void* base) {
+		if (!pd.isSlab() || !pd.extent.hasFinalizers) {
+			return false;
+		}
+
+		import d.gc.late;
+		return lateContains(base);
 	}
 
 	/**
@@ -454,6 +568,13 @@ public:
 		auto ec = pd.extentClass;
 		auto samePointerness = containsPointers == pd.containsPointers;
 
+		// Whether the block has a used capacity of its own, which a plain block
+		// does not: a large one then has all its pages used. Resizing must not
+		// turn a plain block into an appendable one (see `hook_fetchAllocInfo`).
+		bool appendable = ec.isSlab()
+			? SlabAllocInfo(pd, ptr).hasMetadata
+			: pd.extent.usedCapacity != pd.extent.size;
+
 		if (ec.isSlab()) {
 			auto newSizeClass = getSizeClass(size);
 			auto oldSizeClass = ec.sizeClass;
@@ -464,6 +585,13 @@ public:
 				}
 
 				auto si = SlabAllocInfo(pd, ptr);
+
+				// A plain block has no used capacity to update, and must not
+				// become appendable (GC.getAttr would tell).
+				if (!si.hasMetadata) {
+					return ptr;
+				}
+
 				if (si.setUsedCapacity(size)) {
 					return ptr;
 				}
@@ -499,7 +627,7 @@ public:
 					triggerDeallocationEvent((epages - npages) * PageSize);
 				}
 
-				e.setUsedCapacity(size);
+				e.setUsedCapacity(appendable ? size : e.size);
 				return ptr;
 			}
 
@@ -512,7 +640,7 @@ public:
 			return null;
 		}
 
-		if (!isSmallSize(size)) {
+		if (appendable && !isSmallSize(size)) {
 			auto npd = getPageDescriptor(newPtr);
 			npd.extent.setUsedCapacity(size);
 		}

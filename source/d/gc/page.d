@@ -1719,14 +1719,31 @@ private:
 	static
 	void finalizeSlabNimble(ulong evicted, ulong metadataFlags, int sizeClass,
 	                        Extent* e, size_t nimbleIndex) {
+		import d.gc.slab;
+		auto slotSize = binInfos[sizeClass].slotSize;
+		void* nimbleBase = e.address + (nimbleIndex * 64 * slotSize);
+
+		// Objects that got their finalizer after their allocation, which have
+		// no room for it in their slot, see `d.gc.late`.
+		import d.gc.late;
+		if (evicted != 0 && e.hasFinalizers && lateAny()) {
+			auto late = evicted;
+			while (late != 0) {
+				auto index = countTrailingZeros(late);
+				late &= late - 1;
+
+				void* ptr = nimbleBase + index * slotSize;
+				if (lateRemove(ptr)) {
+					import d.gc.hooks;
+					__sd_gc_finalize_late(ptr);
+				}
+			}
+		}
+
 		auto toFinalize = evicted & metadataFlags;
 		if (toFinalize == 0) {
 			return;
 		}
-
-		import d.gc.slab;
-		auto slotSize = binInfos[sizeClass].slotSize;
-		void* nimbleBase = e.address + (nimbleIndex * 64 * slotSize);
 
 		// All set bits in toFinalize have metadata. If no slot of the slab
 		// ever had a finalizer, there is nothing to call, and no reason to
@@ -1960,6 +1977,105 @@ private:
 		}
 
 		return true;
+	}
+
+	/**
+	 * `GC.runFinalizers`: run the finalizers of the allocations of this filler
+	 * whose destructor lies in `segment` (a library that is being unloaded),
+	 * and forget them. Nothing is freed: the memory goes back to the heap when
+	 * the objects are collected, without a second finalization. Run with no
+	 * collection going on, see `Collector.runFinalizers`.
+	 *
+	 * A slot that was freed and is still in a thread's bin looks allocated
+	 * from here; its finalizer is cleared when the slot is freed again.
+	 */
+	package void runFinalizersInSegment(ref CachedExtentMap emap,
+	                                    const(void)[] segment) shared {
+		auto self = cast(PageFiller*) &this;
+
+		mutex.lock();
+		scope(exit) mutex.unlock();
+
+		for (auto r = self.denseBlocks.range; !r.empty; r.popFront()) {
+			self.runBlockFinalizers(emap, r.front, segment);
+		}
+
+		for (auto r = self.sparseBlocks.range; !r.empty; r.popFront()) {
+			self.runBlockFinalizers(emap, r.front, segment);
+		}
+	}
+
+	void runBlockFinalizers(ref CachedExtentMap emap, BlockDescriptor* block,
+	                        const(void)[] segment) {
+		assert(mutex.isHeld(), "Mutex not held!");
+
+		import d.gc.hooks, d.gc.slab;
+		auto bem = emap.blockLookup(block.address);
+
+		uint i = 0;
+		while (i < PagesInBlock) {
+			i = block.nextAllocatedPage(i);
+			if (i >= PagesInBlock) {
+				break;
+			}
+
+			auto pd = bem.lookup(i);
+			auto e = pd.extent;
+			if (e is null) {
+				i++;
+				continue;
+			}
+
+			auto ec = pd.extentClass;
+			auto npages = e.npages;
+			if (ec.isLarge()) {
+				npages = modUp(npages, PagesInBlock);
+			}
+
+			i += npages;
+
+			if (ec.isLarge()) {
+				auto f = e.finalizer;
+				auto size = e.usedCapacity;
+				if (f !is null && __sd_gc_has_finalizer_in_segment(e.address, size, f, segment)) {
+					// Forget it first: an Error from the finalizer goes up.
+					e.setFinalizer(null);
+					__sd_gc_finalize_from_gc(e.address, size, f);
+				}
+
+				continue;
+			}
+
+			if (!ec.supportsMetadata || !e.hasFinalizers) {
+				continue;
+			}
+
+			auto sc = ec.sizeClass;
+			auto slotSize = binInfos[sc].slotSize;
+			auto nimble = alignUp(binInfos[sc].nslots, 64) / 64;
+			foreach (j; 0 .. nimble) {
+				auto live = e.slabData.rawContent[j] & e.slabMetadataFlags.rawContent[j];
+				while (live != 0) {
+					auto index = countTrailingZeros(live);
+					live &= live - 1;
+
+					void* ptr = e.address + (j * 64 + index) * slotSize;
+					auto metadata = SlotMetadata.fromBlock(ptr, slotSize);
+					auto f = metadata.finalizer;
+					if (f is null) {
+						continue;
+					}
+
+					auto size = slotSize - metadata.freeSpace;
+					if (!__sd_gc_has_finalizer_in_segment(ptr, size, f, segment)) {
+						continue;
+					}
+
+					metadata.clearFinalizer();
+					__sd_gc_finalize_from_gc(ptr, size, f);
+				}
+			}
+		}
 	}
 
 	/**

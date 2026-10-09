@@ -24,6 +24,10 @@ extern(C) nothrow {
 	void __sd_gc_remove_roots(void *ptr) @nogc;
 	uint __sd_gc_enable();
 	uint __sd_gc_disable();
+	void __sd_gc_run_finalizers(const void[] segment);
+	bool __sd_gc_set_finalizer_attr(void* ptr, void* finalizer);
+	void __sd_gc_clear_finalizer_attr(void* ptr);
+	void __sd_gc_profile_stats(ulong* dst);
 
 	// hook prototypes needed for druntime api (see below)
 	void* __sd_gc_hook_alloc(size_t size, bool containsPointers, bool zeroData);
@@ -178,7 +182,13 @@ final class SnazzyGC : GC
 	 */
 	uint setAttr(void* p, uint mask) nothrow
 	{
-		// SDC GC does not support setting attributes after allocation
+		// Only FINALIZE can be given after the allocation (the monitor of an
+		// object needs it, see rt.monitor_). The others are fixed when the
+		// block is allocated: where it is, and whether it is scanned.
+		if (mask & BlkAttr.FINALIZE) {
+			__sd_gc_set_finalizer_attr(p, TYPEINFO_IN_BLOCK);
+		}
+
 		return getAttr(p);
 	}
 
@@ -187,7 +197,10 @@ final class SnazzyGC : GC
 	 */
 	uint clrAttr(void* p, uint mask) nothrow
 	{
-		// SDC GC does not support setting attributes after allocation
+		if (mask & BlkAttr.FINALIZE) {
+			__sd_gc_clear_finalizer_attr(p);
+		}
+
 		return getAttr(p);
 	}
 
@@ -226,7 +239,15 @@ final class SnazzyGC : GC
 	void* realloc(void* p, size_t size, uint bits, const TypeInfo ti) nothrow
 	{
 		checkNotInFinalizer();
-		return __sd_gc_hook_realloc(p, size, (bits & BlkAttr.NO_SCAN) == 0);
+
+		// As in the other collectors, no attributes means to keep those of the
+		// block (the part that we have, whether it is scanned).
+		bool noScan = (bits & BlkAttr.NO_SCAN) != 0;
+		if (bits == 0 && p !is null) {
+			noScan = (query(p).attr & BlkAttr.NO_SCAN) != 0;
+		}
+
+		return __sd_gc_hook_realloc(p, size, !noScan);
 	}
 
 	/**
@@ -316,10 +337,19 @@ final class SnazzyGC : GC
 	 * Retrieve profile statistics about garbage collection.
 	 * Useful for debugging and tuning.
 	 */
-	core.memory.GC.ProfileStats profileStats() @safe nothrow @nogc
+	core.memory.GC.ProfileStats profileStats() @trusted nothrow @nogc
 	{
-		// TODO: add once there is a hook
-		return core.memory.GC.ProfileStats();
+		import core.time : hnsecs;
+		ulong[5] v;
+		(cast(void function(ulong*) nothrow @nogc) &__sd_gc_profile_stats)(v.ptr);
+
+		core.memory.GC.ProfileStats ps;
+		ps.numCollections = cast(size_t) v[0];
+		ps.totalCollectionTime = hnsecs(v[1]);
+		ps.totalPauseTime = hnsecs(v[2]);
+		ps.maxPauseTime = hnsecs(v[3]);
+		ps.maxCollectionTime = hnsecs(v[4]);
+		return ps;
 	}
 
 	/**
@@ -380,7 +410,7 @@ final class SnazzyGC : GC
 	 */
 	void runFinalizers(const scope void[] segment) nothrow
 	{
-		// TODO: add once there is a hook
+		__sd_gc_run_finalizers(segment);
 	}
 
 	/*
@@ -529,6 +559,13 @@ BlkInfo hook_fetchAllocInfo(void* ptr) {
 	if (pd.isSlab()) {
 		import d.gc.slab;
 		auto si = SlabAllocInfo(pd, ptr);
+
+		// A slot in this thread's cache is free: never handed out, or freed by
+		// this thread (GC.free, delete). The stock collector says so as well.
+		if (threadCache.isFreeInCache(pd, si.address)) {
+			return BlkInfo.init;
+		}
+
 		result.base = cast(void*) si.address;
 
 		if (si.hasMetadata) {
@@ -538,10 +575,19 @@ BlkInfo hook_fetchAllocInfo(void* ptr) {
 			}
 		}
 
+		// A finalizer given after the allocation, see d.gc.late.
+		if (!(result.attr & BlkAttr.FINALIZE)
+			    && threadCache.hasFinalizerAttr(pd, si.address)) {
+			result.attr |= BlkAttr.FINALIZE;
+		}
+
 		result.size = si.slotCapacity;
 	} else {
-		// Large blocks are always appendable.
-		result.attr |= BlkAttr.APPENDABLE;
+		// A large block has a used capacity of its own when it was allocated
+		// to be appended to; a plain one has all its pages in use.
+		if (e.usedCapacity != e.size) {
+			result.attr |= BlkAttr.APPENDABLE;
+		}
 
 		if (e.finalizer) {
 			result.attr |= BlkAttr.FINALIZE;

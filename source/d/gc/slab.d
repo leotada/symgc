@@ -145,6 +145,15 @@ public:
 	bool hasFinalizer() {
 		return (data.freeSpaceData.freeSpace & FinalizerBit) != 0;
 	}
+
+	/**
+	 * The finalizer has run (`GC.runFinalizers`): forget it, so that neither
+	 * the sweep nor a later free runs it again. The free space stays.
+	 */
+	void clearFinalizer() {
+		// TODO: Currently only works on little-endian, like the rest.
+		data.finalizerData &= ~(AddressMask | (size_t(FinalizerBit) << 48));
+	}
 }
 
 static assert(SlotMetadata.sizeof == size_t.sizeof,
