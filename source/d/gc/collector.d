@@ -438,7 +438,7 @@ private:
 		scope(exit) list.free();
 
 		enum MaxRounds = 8;
-		enum RemarkPages = 2048; // 8 MiB
+		enum RemarkPages = 512; // 2 MiB
 
 		uint rounds = 0;
 		size_t lastPages = 0;
