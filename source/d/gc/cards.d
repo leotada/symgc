@@ -87,8 +87,35 @@ extern(C) void __sd_gc_card_range(void* dst, size_t size) {
 
 	auto first = cast(size_t) dst >> CardShift;
 	auto last = (cast(size_t) dst + size - 1) >> CardShift;
-	__sd_gc_card_base[first .. last + 1] = 1;
-	__sd_gc_card_summary_base[(first >> (SummaryShift - CardShift)) .. (last >> (SummaryShift - CardShift)) + 1] = 1;
+	auto cards = __sd_gc_card_base;
+	auto sums = __sd_gc_card_summary_base;
+
+	/**
+	 * A copy of up to a few cards is the common one (an array of a few
+	 * elements, a struct): plain byte stores. The slice assignments below
+	 * are calls to memset, which cost more than the copy itself for a small
+	 * array (copying 8 ints: 2.3 ns without the barrier, 8.3 ns with it).
+	 * The stores are atomic, relaxed, so that the compiler does not turn
+	 * the loop back into a memset.
+	 */
+	enum SmallRange = 4;
+	if (last - first < SmallRange) {
+		foreach (c; first .. last + 1) {
+			atomicStore!(MemoryOrder.raw)(*cast(shared(ubyte)*) (cards + c), ubyte(1));
+		}
+
+		auto s = first >> (SummaryShift - CardShift);
+		atomicStore!(MemoryOrder.raw)(*cast(shared(ubyte)*) (sums + s), ubyte(1));
+		auto e = last >> (SummaryShift - CardShift);
+		if (e != s) {
+			atomicStore!(MemoryOrder.raw)(*cast(shared(ubyte)*) (sums + e), ubyte(1));
+		}
+
+		return;
+	}
+
+	cards[first .. last + 1] = 1;
+	sums[(first >> (SummaryShift - CardShift)) .. (last >> (SummaryShift - CardShift)) + 1] = 1;
 }
 
 /**
