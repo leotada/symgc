@@ -417,9 +417,11 @@ public:
 			version(linux) {
 				import core.stdc.stdlib : getenv, atoi;
 				import core.sys.posix.sys.resource : setpriority, PRIO_PROCESS;
+				int nice = 10;
 				if (auto env = getenv("SYMGC_MARK_NICE")) {
-					setpriority(PRIO_PROCESS, 0, atoi(env));
+					nice = atoi(env);
 				}
+				setpriority(PRIO_PROCESS, 0, nice);
 			}
 
 			// Set a flag saying we should not be using our local thread cache.

@@ -269,9 +269,15 @@ private:
 		// start the threads
 		auto threadCount = gCollectorState.scanningThreads;
 		if (threadCount == 0) {
-			import d.gc.cpu;
-			threadCount = getCoreCount();
-			assert(threadCount >= 1, "Expected at least one thread!");
+			import core.stdc.stdlib : getenv, atoi;
+			auto env = getenv("SYMGC_MARK_THREADS");
+			if (env !is null && atoi(env) > 0) {
+				threadCount = atoi(env);
+			} else {
+				import d.gc.cpu;
+				threadCount = getCoreCount();
+				assert(threadCount >= 1, "Expected at least one thread!");
+			}
 		}
 
 		import symgc.thread;
