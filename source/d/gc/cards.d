@@ -76,6 +76,19 @@ extern(C) void __sd_gc_card_init() {
 	__sd_gc_card_base = cast(ubyte*) p;
 }
 
+private __gshared bool gSummaryEnabled = false;
+private __gshared bool gSummaryChecked = false;
+
+private bool isSummaryEnabled() {
+	if (!gSummaryChecked) {
+		import core.stdc.stdlib : getenv;
+		auto env = getenv("SYMGC_CARD_SUMMARY");
+		gSummaryEnabled = (env !is null && env[0] == '1');
+		gSummaryChecked = true;
+	}
+	return gSummaryEnabled;
+}
+
 /**
  * Mark every card of a range. The compiler calls this after a copy that
  * may carry pointers into memory it cannot see through.
@@ -89,6 +102,7 @@ extern(C) void __sd_gc_card_range(void* dst, size_t size) {
 	auto last = (cast(size_t) dst + size - 1) >> CardShift;
 	auto cards = __sd_gc_card_base;
 	auto sums = __sd_gc_card_summary_base;
+	const bool useSummary = isSummaryEnabled();
 
 	/**
 	 * A copy of up to a few cards is the common one (an array of a few
@@ -104,18 +118,22 @@ extern(C) void __sd_gc_card_range(void* dst, size_t size) {
 			atomicStore!(MemoryOrder.raw)(*cast(shared(ubyte)*) (cards + c), ubyte(1));
 		}
 
-		auto s = first >> (SummaryShift - CardShift);
-		atomicStore!(MemoryOrder.raw)(*cast(shared(ubyte)*) (sums + s), ubyte(1));
-		auto e = last >> (SummaryShift - CardShift);
-		if (e != s) {
-			atomicStore!(MemoryOrder.raw)(*cast(shared(ubyte)*) (sums + e), ubyte(1));
+		if (useSummary && sums !is null) {
+			auto s = first >> (SummaryShift - CardShift);
+			atomicStore!(MemoryOrder.raw)(*cast(shared(ubyte)*) (sums + s), ubyte(1));
+			auto e = last >> (SummaryShift - CardShift);
+			if (e != s) {
+				atomicStore!(MemoryOrder.raw)(*cast(shared(ubyte)*) (sums + e), ubyte(1));
+			}
 		}
 
 		return;
 	}
 
 	cards[first .. last + 1] = 1;
-	sums[(first >> (SummaryShift - CardShift)) .. (last >> (SummaryShift - CardShift)) + 1] = 1;
+	if (useSummary && sums !is null) {
+		sums[(first >> (SummaryShift - CardShift)) .. (last >> (SummaryShift - CardShift)) + 1] = 1;
+	}
 }
 
 /**
@@ -157,57 +175,114 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
 		runHi = s + PageSize;
 	}
 
-	// The summary says which 64 KiB regions have a dirty card. It is read and
-	// cleared first, so a card set meanwhile sets its summary again.
-	auto sbase = __sd_gc_card_summary_base;
-	auto slo = lo >> (SummaryShift - CardShift);
-	auto shi = (hi + CardsPerSummary - 1) >> (SummaryShift - CardShift);
+	// If summary byte tracking is enabled, skip 64 KiB regions via the summary table
+	if (isSummaryEnabled() && __sd_gc_card_summary_base !is null) {
+		auto sbase = __sd_gc_card_summary_base;
+		auto slo = lo >> (SummaryShift - CardShift);
+		auto shi = (hi + CardsPerSummary - 1) >> (SummaryShift - CardShift);
 
-	foreach (si; slo .. shi) {
-		auto sb = cast(shared(ubyte)*) (sbase + si);
-		if (atomicLoad!(MemoryOrder.raw)(*sb) == 0) {
-			continue;
-		}
+		foreach (si; slo .. shi) {
+			auto sb = cast(shared(ubyte)*) (sbase + si);
+			if (atomicLoad!(MemoryOrder.raw)(*sb) == 0) {
+				continue;
+			}
 
-		atomicStore!(MemoryOrder.rel)(*sb, ubyte(0));
+			atomicStore!(MemoryOrder.rel)(*sb, ubyte(0));
 
-		auto from = si << (SummaryShift - CardShift);
-		auto to = from + CardsPerSummary;
-		if (from < lo) {
-			from = lo;
-		}
-		if (to > hi) {
-			to = hi;
-		}
+			auto from = si << (SummaryShift - CardShift);
+			auto to = from + CardsPerSummary;
+			if (from < lo) {
+				from = lo;
+			}
+			if (to > hi) {
+				to = hi;
+			}
 
-		// Eight cards at a time: an exchange of the whole word is atomic
-		// against the byte stores of the program, so a card set after it
-		// is seen next time.
-		size_t i = from;
-		while (i < to) {
-			if ((i & 7) == 0 && i + 8 <= to) {
-				auto w = cast(shared(ulong)*) (base + i);
-				if (atomicLoad!(MemoryOrder.raw)(*w) == 0) {
+			size_t i = from;
+			while (i < to) {
+				if ((i & 7) == 0 && i + 8 <= to) {
+					auto w = cast(shared(ulong)*) (base + i);
+					if (atomicLoad!(MemoryOrder.raw)(*w) == 0) {
+						i += 8;
+						continue;
+					}
+
+					auto v = atomicExchange!(MemoryOrder.acq_rel)(w, 0UL);
+					foreach (j; 0 .. 8) {
+						if ((v >> (8 * j)) & 0xff) {
+							page((i + j) / CardsPerPage);
+						}
+					}
+
 					i += 8;
 					continue;
 				}
 
+				auto b = cast(shared(ubyte)*) (base + i);
+				if (atomicExchange!(MemoryOrder.acq_rel)(b, ubyte(0))) {
+					page(i / CardsPerPage);
+				}
+
+				i++;
+			}
+		}
+	} else {
+		// Fast direct card scan with unrolled 32-card (16 KiB) zero check
+		size_t i = lo;
+		while (i < hi && (i & 7) != 0) {
+			auto b = cast(shared(ubyte)*) (base + i);
+			if (atomicExchange!(MemoryOrder.acq_rel)(b, ubyte(0))) {
+				page(i / CardsPerPage);
+			}
+			i++;
+		}
+
+		while (i + 32 <= hi) {
+			auto w0 = cast(shared(ulong)*) (base + i);
+			auto w1 = cast(shared(ulong)*) (base + i + 8);
+			auto w2 = cast(shared(ulong)*) (base + i + 16);
+			auto w3 = cast(shared(ulong)*) (base + i + 24);
+
+			if ((atomicLoad!(MemoryOrder.raw)(*w0) |
+			     atomicLoad!(MemoryOrder.raw)(*w1) |
+			     atomicLoad!(MemoryOrder.raw)(*w2) |
+			     atomicLoad!(MemoryOrder.raw)(*w3)) == 0) {
+				i += 32;
+				continue;
+			}
+
+			foreach (chunk; 0 .. 4) {
+				auto w = cast(shared(ulong)*) (base + i + chunk * 8);
+				if (atomicLoad!(MemoryOrder.raw)(*w) != 0) {
+					auto v = atomicExchange!(MemoryOrder.acq_rel)(w, 0UL);
+					foreach (j; 0 .. 8) {
+						if ((v >> (8 * j)) & 0xff) {
+							page((i + chunk * 8 + j) / CardsPerPage);
+						}
+					}
+				}
+			}
+			i += 32;
+		}
+
+		while (i + 8 <= hi) {
+			auto w = cast(shared(ulong)*) (base + i);
+			if (atomicLoad!(MemoryOrder.raw)(*w) != 0) {
 				auto v = atomicExchange!(MemoryOrder.acq_rel)(w, 0UL);
 				foreach (j; 0 .. 8) {
 					if ((v >> (8 * j)) & 0xff) {
 						page((i + j) / CardsPerPage);
 					}
 				}
-
-				i += 8;
-				continue;
 			}
+			i += 8;
+		}
 
+		while (i < hi) {
 			auto b = cast(shared(ubyte)*) (base + i);
 			if (atomicExchange!(MemoryOrder.acq_rel)(b, ubyte(0))) {
 				page(i / CardsPerPage);
 			}
-
 			i++;
 		}
 	}
