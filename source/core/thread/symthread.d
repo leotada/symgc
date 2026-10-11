@@ -84,6 +84,9 @@ bool suspendDruntimeThreads(bool alwaysSignal, ref uint suspended) {
 			// determine if this thread is suspended or should be suspended.
 			auto ss = tc.suspendState;
 
+			if (ss == SuspendState.Detached)
+				continue;
+
 			suspended += ss == SuspendState.Suspended;
 			retry |= ss != SuspendState.Suspended;
 
@@ -97,6 +100,10 @@ bool suspendDruntimeThreads(bool alwaysSignal, ref uint suspended) {
 		else version(Windows)
 		{
 			// use the same states to make the code consistent.
+			auto ss = tc.suspendState;
+			if (ss == SuspendState.Detached)
+				continue;
+
 			tc.sendSuspendSignal();
 
 			if (core_thread_osthread_suspend(t)) {
@@ -153,13 +160,37 @@ void scanWorldPausedData(ScanDg scan) {
 	// thread that is not a druntime thread has none.
 	auto self = Thread.getThis();
 	auto myStackBottom = self is null ? null : self.m_curr.bstack;
+
+	void*[2][8] detachedStacks = void;
+	size_t numDetached = 0;
+	foreach(t; ThreadIterator(ThreadBase.sm_tbeg.toThread)) {
+		import d.gc.tcache : ThreadCache;
+		import d.gc.tstate : SuspendState;
+		auto tc = cast(ThreadCache*) t.tlsGCData();
+		if (tc !is null && tc.suspendState == SuspendState.Detached && numDetached < 8) {
+			auto b = t.m_curr.bstack;
+			auto top = t.m_curr.tstack;
+			if (b !is null) {
+				detachedStacks[numDetached][0] = top < b ? top : b;
+				detachedStacks[numDetached][1] = top < b ? b : top;
+				numDetached++;
+			}
+		}
+	}
+
 	void scanItem(ScanType type, void* pbot, void* ptop) nothrow {
 		import d.gc.range;
 		auto r = makeRange(pbot, ptop);
-		if (type == ScanType.stack && myStackBottom !is null && myStackBottom >= r.ptr &&
-				myStackBottom <= r.ptr + r.length)
-			// my stack range, no need to scan right now, this will be scanned later
-			return;
+		if (type == ScanType.stack) {
+			if (myStackBottom !is null && myStackBottom >= r.ptr &&
+					myStackBottom <= r.ptr + r.length)
+				// my stack range, no need to scan right now, this will be scanned later
+				return;
+			foreach(i; 0 .. numDetached) {
+				if (r.ptr >= detachedStacks[i][0] && r.ptr <= detachedStacks[i][1])
+					return; // Skip stack of detached/RT audio thread
+			}
+		}
 		// TODO: ignore my thread's TLS data as well.
 		// TODO: shouldn't need this cast
 		alias NoThrowScanDg = void delegate(const(void*)[] range) nothrow;
@@ -186,6 +217,8 @@ bool resumeDruntimeThreads(ref uint suspended) {
 		}
 
 		auto ss = tc.suspendState;
+		if (ss == SuspendState.Detached)
+			continue;
 
 		version(Posix) {
 			suspended += ss == SuspendState.Suspended;

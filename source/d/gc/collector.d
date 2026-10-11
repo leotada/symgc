@@ -169,6 +169,49 @@ struct Collector {
 		}
 	}
 
+	/**
+	 * Helps background sweeping up to maxTimeHns (100ns units).
+	 * If maxTimeHns is 0, performs a single pass across arenas.
+	 */
+	void assistSweepTimed(ulong maxTimeHns) {
+		import d.gc.extent : gSweepCycle;
+		import d.gc.page : AssistResult;
+		import d.gc.time : getMonotonicTime;
+
+		if (gSweepCycle.load() == 0) {
+			return;
+		}
+
+		auto start = getMonotonicTime();
+
+		threadCache.startCollection();
+		scope(exit) threadCache.endCollection();
+
+		while (gSweepCycle.load() != 0) {
+			bool worked = false;
+			bool waiting = false;
+			foreach (i; 0 .. ArenaCount) {
+				auto a = Arena.getIfInitialized(i);
+				if (a !is null) {
+					auto r = a.assistSweep(emap);
+					worked |= r == AssistResult.Worked;
+					waiting |= r == AssistResult.Waiting;
+				}
+			}
+
+			if (!worked && !waiting) {
+				break;
+			}
+
+			if (maxTimeHns > 0 && (getMonotonicTime() - start) >= maxTimeHns) {
+				break;
+			}
+			if (maxTimeHns == 0) {
+				break;
+			}
+		}
+	}
+
 	void runGCCycle() {
 		/**
 		 * An explicit collection is synchronous: let a running background

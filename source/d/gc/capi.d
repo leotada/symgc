@@ -134,3 +134,24 @@ void __sd_gc_time_total(ulong* dst) {
 PageDescriptor __sd_gc_maybe_get_page_descriptor(void* ptr) {
 	return threadCache.maybeGetPageDescriptor(ptr);
 }
+
+void __sd_gc_exclude_current_thread() {
+	threadCache.state.preventPausing();
+	threadCache.activateGC(false);
+}
+
+void __sd_gc_include_current_thread() {
+	threadCache.state.allowPausing();
+	threadCache.activateGC(true);
+}
+
+bool __sd_gc_is_thread_excluded() {
+	import d.gc.tstate : SuspendState;
+	return threadCache.state.suspendState == SuspendState.Detached;
+}
+
+void __sd_gc_step(ulong maxTimeHns) {
+	import d.gc.collector;
+	auto collector = Collector(&threadCache);
+	collector.assistSweepTimed(maxTimeHns);
+}

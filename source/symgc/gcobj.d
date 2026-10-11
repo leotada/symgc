@@ -28,6 +28,12 @@ extern(C) nothrow {
 	bool __sd_gc_set_finalizer_attr(void* ptr, void* finalizer);
 	void __sd_gc_clear_finalizer_attr(void* ptr);
 	void __sd_gc_profile_stats(ulong* dst);
+	void __sd_gc_exclude_current_thread();
+	void __sd_gc_include_current_thread();
+	bool __sd_gc_is_thread_excluded();
+	void __sd_gc_step(ulong maxTimeHns);
+	void __sd_gc_time_thread(ulong* dst);
+	void __sd_gc_time_total(ulong* dst);
 
 	// hook prototypes needed for druntime api (see below)
 	void* __sd_gc_hook_alloc(size_t size, bool containsPointers, bool zeroData);
@@ -137,7 +143,7 @@ private GC initialize()
 	return initializeQuiet();
 }
 
-final class SnazzyGC : GC
+final class SnazzyGC : GC, GCTelemetry
 {
 	void enable()
 	{
@@ -350,6 +356,68 @@ final class SnazzyGC : GC
 		ps.maxPauseTime = hnsecs(v[3]);
 		ps.maxCollectionTime = hnsecs(v[4]);
 		return ps;
+	}
+
+	/**
+	 * Retrieve real-time frame telemetry about garbage collection.
+	 * Designed for game loops, profilers, and HUDs.
+	 */
+	core.memory.GC.FrameStats frameStats() nothrow @nogc @safe
+	{
+		import core.time : nsecs;
+		import d.gc.extent : gMarkActive, gSweepCycle;
+
+		ulong[6] threadTimes = void;
+		ulong[6] totalTimes = void;
+		() @trusted nothrow @nogc {
+			(cast(void function(ulong*) nothrow @nogc)&__sd_gc_time_thread)(threadTimes.ptr);
+			(cast(void function(ulong*) nothrow @nogc)&__sd_gc_time_total)(totalTimes.ptr);
+		}();
+
+		core.memory.GC.FrameStats fs;
+		fs.threadAllocTime = nsecs(threadTimes[0]);
+		fs.threadCollectTime = nsecs(threadTimes[1]);
+		fs.threadPauseTime = nsecs(threadTimes[2]);
+
+		fs.totalAllocTime = nsecs(totalTimes[0]);
+		fs.totalCollectTime = nsecs(totalTimes[1]);
+		fs.totalPauseTime = nsecs(totalTimes[2]);
+
+		fs.isCycleActive = (gMarkActive.load() != 0) || (gSweepCycle.load() != 0);
+
+		auto s = this.stats();
+		import d.gc.arena : Arena;
+		import d.gc.spec : PageSize;
+		size_t activeUsed = () @trusted nothrow @nogc {
+			return (cast(size_t function() nothrow @nogc)&Arena.computeUsedPageCount)() * PageSize;
+		}();
+		fs.usedSize = activeUsed > 0 ? activeUsed : s.usedSize;
+		fs.freeSize = s.freeSize;
+
+		auto ps = this.profileStats();
+		fs.numCollections = ps.numCollections;
+
+		return fs;
+	}
+
+	void excludeCurrentThread() @trusted nothrow @nogc
+	{
+		(cast(void function() nothrow @nogc)&__sd_gc_exclude_current_thread)();
+	}
+
+	void includeCurrentThread() @trusted nothrow @nogc
+	{
+		(cast(void function() nothrow @nogc)&__sd_gc_include_current_thread)();
+	}
+
+	bool isThreadExcluded() @trusted nothrow @nogc
+	{
+		return (cast(bool function() nothrow @nogc)&__sd_gc_is_thread_excluded)();
+	}
+
+	void step(ulong maxTimeHns) @trusted nothrow @nogc
+	{
+		(cast(void function(ulong) nothrow @nogc)&__sd_gc_step)(maxTimeHns);
 	}
 
 	/**

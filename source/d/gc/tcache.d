@@ -253,7 +253,7 @@ public:
 		stackBottom = getStackBottom();
 	}
 
-	bool activateGC(bool activated = true) {
+	bool activateGC(bool activated = true) nothrow @nogc {
 		scope(exit) enableGC = activated;
 		return enableGC;
 	}

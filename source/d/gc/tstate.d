@@ -82,13 +82,34 @@ public:
 		}
 	}
 
-	void preventPausing() {
+	void preventPausing() nothrow @nogc {
 		auto s = state.load();
 		while (true) {
+			if (status(s) == SuspendState.Detached) {
+				break;
+			}
+
 			auto n = s + SuspendState.Detached;
 
 			assert(status(s) == SuspendState.None);
 			assert(status(n) == SuspendState.Detached);
+
+			if (state.casWeak(s, n)) {
+				break;
+			}
+		}
+	}
+
+	void allowPausing() nothrow @nogc {
+		auto s = state.load();
+		while (true) {
+			if (status(s) == SuspendState.None) {
+				break;
+			}
+
+			assert(status(s) == SuspendState.Detached);
+			auto n = s - SuspendState.Detached;
+			assert(status(n) == SuspendState.None);
 
 			if (state.casWeak(s, n)) {
 				break;
