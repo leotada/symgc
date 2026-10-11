@@ -588,7 +588,7 @@ public:
 
 				// A plain block has no used capacity to update, and must not
 				// become appendable (GC.getAttr would tell).
-				if (!si.hasMetadata) {
+				if (!si.hasMetadata && ptr !is appendBase) {
 					return ptr;
 				}
 
