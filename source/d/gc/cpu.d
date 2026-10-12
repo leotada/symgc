@@ -23,6 +23,14 @@ auto computeCoreCount() {
 		import core.cpuid;
 		return threadsPerCPU();
 	}
+	else version(Posix) {
+		import core.sys.posix.unistd : sysconf, _SC_NPROCESSORS_ONLN;
+		auto count = sysconf(_SC_NPROCESSORS_ONLN);
+		return count > 0 ? cast(uint) count : 1;
+	}
+	else {
+		return 1;
+	}
 }
 
 @"getCoreCount" unittest {

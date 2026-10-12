@@ -19,7 +19,21 @@ module d.gc.cards;
  */
 
 
-import core.sys.posix.sys.mman;
+version(Windows) {
+	import core.sys.windows.winbase : VirtualAlloc, MEM_RESERVE, MEM_COMMIT, PAGE_READWRITE;
+} else version(Posix) {
+	version(linux) {
+		import core.sys.linux.sys.mman;
+		enum MAP_NORESERVE = 0x4000;
+	} else version(OSX) {
+		import core.sys.darwin.sys.mman;
+		enum MAP_NORESERVE = 0;
+		enum MAP_ANONYMOUS = MAP_ANON;
+	} else {
+		import core.sys.posix.sys.mman;
+		enum MAP_NORESERVE = 0x4000;
+	}
+}
 import core.atomic;
 
 enum CardShift = 9;
@@ -45,35 +59,52 @@ extern(C) __gshared ubyte* __sd_gc_card_summary_base;
 /**
  * Mapped before any code that stores a pointer runs, not lazily. The
  * constructors of the program run in no defined order, so this goes in
- * `.preinit_array`, which the dynamic loader runs before all of them.
+ * `.preinit_array` (Linux/ELF), `__DATA,__mod_init_func` (macOS), or
+ * `.CRT$XCU` (Windows), which the dynamic loader runs before all of them.
  */
 extern(C) void __sd_gc_card_init() {
 	if (__sd_gc_card_base !is null) {
 		return;
 	}
 
-	enum NoReserve = 0x4000; // MAP_NORESERVE on Linux
-	auto q = mmap(null, SummarySize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | NoReserve, -1, 0);
-	if (q is MAP_FAILED) {
-		import core.stdc.stdio : fputs, stderr;
-		import core.stdc.stdlib : abort;
-		fputs("symgc: cannot map the card summary\n", stderr);
-		abort();
+	version(Windows) {
+		auto q = VirtualAlloc(null, SummarySize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+		if (q is null) {
+			import core.stdc.stdio : fputs, stderr;
+			import core.stdc.stdlib : abort;
+			fputs("symgc: cannot map the card summary\n", stderr);
+			abort();
+		}
+		__sd_gc_card_summary_base = cast(ubyte*) q;
+
+		auto p = VirtualAlloc(null, TableSize, MEM_RESERVE, PAGE_READWRITE);
+		if (p is null) {
+			import core.stdc.stdio : fputs, stderr;
+			import core.stdc.stdlib : abort;
+			fputs("symgc: cannot map the card table\n", stderr);
+			abort();
+		}
+		__sd_gc_card_base = cast(ubyte*) p;
+	} else version(Posix) {
+		enum Flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
+		auto q = mmap(null, SummarySize, PROT_READ | PROT_WRITE, Flags, -1, 0);
+		if (q is MAP_FAILED) {
+			import core.stdc.stdio : fputs, stderr;
+			import core.stdc.stdlib : abort;
+			fputs("symgc: cannot map the card summary\n", stderr);
+			abort();
+		}
+		__sd_gc_card_summary_base = cast(ubyte*) q;
+
+		auto p = mmap(null, TableSize, PROT_READ | PROT_WRITE, Flags, -1, 0);
+		if (p is MAP_FAILED) {
+			import core.stdc.stdio : fputs, stderr;
+			import core.stdc.stdlib : abort;
+			fputs("symgc: cannot map the card table\n", stderr);
+			abort();
+		}
+		__sd_gc_card_base = cast(ubyte*) p;
 	}
-
-	__sd_gc_card_summary_base = cast(ubyte*) q;
-
-	enum MAP_NORESERVE = 0x4000; // Linux
-	enum Flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
-	auto p = mmap(null, TableSize, PROT_READ | PROT_WRITE, Flags, -1, 0);
-	if (p is MAP_FAILED) {
-		import core.stdc.stdio : fputs, stderr;
-		import core.stdc.stdlib : abort;
-		fputs("symgc: cannot map the card table\n", stderr);
-		abort();
-	}
-
-	__sd_gc_card_base = cast(ubyte*) p;
 }
 
 private __gshared bool gSummaryEnabled = false;
@@ -301,5 +332,11 @@ void clearCards(size_t start, size_t size) {
 version(LDC) {
 	import ldc.attributes : section;
 
-	@section(".preinit_array") __gshared extern(C) void function() __sd_gc_card_preinit = &__sd_gc_card_init;
+	version(Windows) {
+		@section(".CRT$XCU") __gshared extern(C) void function() __sd_gc_card_preinit = &__sd_gc_card_init;
+	} else version(OSX) {
+		@section("__DATA,__mod_init_func") __gshared extern(C) void function() __sd_gc_card_preinit = &__sd_gc_card_init;
+	} else {
+		@section(".preinit_array") __gshared extern(C) void function() __sd_gc_card_preinit = &__sd_gc_card_init;
+	}
 }

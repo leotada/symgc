@@ -3,11 +3,19 @@ module d.gc.memmap;
 import d.gc.spec;
 import d.gc.util;
 
-version(linux) {
-	import core.sys.linux.sys.mman;
-
-	// not included in druntime for some reason
-	enum MADV_FREE = 8;
+version(Posix) {
+	version(linux) {
+		import core.sys.linux.sys.mman;
+		enum MADV_FREE = 8;
+	} else version(OSX) {
+		import core.sys.darwin.sys.mman;
+		enum MAP_NORESERVE = 0;
+		enum MAP_ANONYMOUS = MAP_ANON;
+		enum MADV_FREE = 5;
+	} else {
+		import core.sys.posix.sys.mman;
+		enum MAP_NORESERVE = 0x4000;
+	}
 }
 else version(Windows) {
 	import core.sys.windows.winbase;
@@ -98,17 +106,39 @@ void pages_commit(void* addr, size_t size) {
 		auto ret = VirtualAlloc(addr, size, MEM_COMMIT, PAGE_READWRITE);
 		if (ret !is null) {
 			assert(ret is addr, "MEM_COMMIT moved alloction!");
+			version(Symgc_cards) {
+				import d.gc.cards : __sd_gc_card_base, CardShift;
+				if (__sd_gc_card_base !is null) {
+					size_t cardOffset = (cast(size_t) addr) >> CardShift;
+					size_t cardBytes = (size >> CardShift);
+					if (cardBytes == 0) cardBytes = 1;
+					size_t alignedOffset = cardOffset & ~4095UL;
+					size_t alignedBytes = ((cardOffset + cardBytes + 4095UL) & ~4095UL) - alignedOffset;
+					VirtualAlloc(__sd_gc_card_base + alignedOffset, alignedBytes, MEM_COMMIT, PAGE_READWRITE);
+				}
+			}
 			return;
 		}
 
 		if (applyPerReservation(VmOp.commit, addr, size)) {
+			version(Symgc_cards) {
+				import d.gc.cards : __sd_gc_card_base, CardShift;
+				if (__sd_gc_card_base !is null) {
+					size_t cardOffset = (cast(size_t) addr) >> CardShift;
+					size_t cardBytes = (size >> CardShift);
+					if (cardBytes == 0) cardBytes = 1;
+					size_t alignedOffset = cardOffset & ~4095UL;
+					size_t alignedBytes = ((cardOffset + cardBytes + 4095UL) & ~4095UL) - alignedOffset;
+					VirtualAlloc(__sd_gc_card_base + alignedOffset, alignedBytes, MEM_COMMIT, PAGE_READWRITE);
+				}
+			}
 			return;
 		}
 
 		reportVmFailure("MEM_COMMIT", addr, size);
 		assert(false, "Could not commit memory!");
 	}
-	// linux does not need explicit commit
+	// Posix does not need explicit commit
 }
 
 version(Windows) {
@@ -263,7 +293,7 @@ version(Windows)
 }
 
 void pages_unmap(void* addr, size_t size) {
-	version(linux) {
+	version(Posix) {
 		auto ret = munmap(addr, size);
 		assert(ret == 0, "munmap failed!");
 	}
@@ -274,10 +304,25 @@ void pages_unmap(void* addr, size_t size) {
 }
 
 void pages_purge(void* addr, size_t size) {
-	version(linux) {
+	version(Posix) {
 		auto ret = madvise(addr, size, MADV_DONTNEED);
 		assert(ret == 0, "madvise failed!");
 	} else version(Windows) {
+		version(Symgc_cards) {
+			import d.gc.cards : __sd_gc_card_base, CardShift;
+			if (__sd_gc_card_base !is null) {
+				size_t cardOffset = (cast(size_t) addr) >> CardShift;
+				size_t cardBytes = (size >> CardShift);
+				if (cardBytes > 0) {
+					size_t alignedOffset = cardOffset & ~4095UL;
+					size_t alignedBytes = (cardBytes & ~4095UL);
+					if (alignedBytes > 0) {
+						VirtualFree(__sd_gc_card_base + alignedOffset, alignedBytes, MEM_DECOMMIT);
+					}
+				}
+			}
+		}
+
 		/**
 		 * This used to discard the result. A decommit that straddles two
 		 * reservations fails with ERROR_INVALID_PARAMETER and leaves the pages
@@ -410,9 +455,9 @@ void* os_pages_map(void* addr, size_t size, size_t alignment) {
 	assert(isAligned(addr, alignment), "Invalid addr!");
 	assert(size > 0 && isAligned(size, PageSize), "Invalid size!");
 
-	version(linux) {
+	version(Posix) {
 		enum PagesFDTag = -1;
-		enum MMapFlags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+		enum MMapFlags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
 
 		auto ret =
 			mmap(addr, size, PROT_READ | PROT_WRITE, MMapFlags, PagesFDTag, 0);
