@@ -83,6 +83,12 @@ burst of allocation, such as loading a level, has no history and still pays the 
 more than half the target is allocating faster than the mark can follow, and more room only makes its heap bigger, so
 it keeps the quarter (`SYMGC_ADAPTIVE_LIMIT=0` turns the whole mechanism off).
 
+*Update.* Most of that growth was the collector's own: the mark's work list was allocated in the heap and grown by
+realloc, and a concurrent mark frees nothing, so each step of its growth stayed until the next cycle (197 MiB for a
+list of 32 MiB). The list now has a mapping of its own, so a heap of a gigabyte grows by what the program allocates
+(about 3,000 pages in a mark of a second and a half), the stalls this section describes are gone in the measurements
+(`benchmarks.md`, "the growth was the mark's own work list"), and the adaptive allowance has no measured effect left.
+
 The mark is the algorithm of Boehm, Demers and Shenker ("Mostly parallel garbage collection", PLDI 1991): mark while
 the program runs, then fix up what it changed. Pauses depend mostly on the number of threads and on how much was
 written during the last round. Only the remark's read of the card table grows with the heap, slowly (about 0.2 ms

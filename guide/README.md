@@ -9,6 +9,12 @@ lose a frame to the collector.
 but has not been built; Android and iOS need work (`platforms.md`). It is meant to be tried, measured and reported
 on, not shipped yet.
 
+**A note on paths.** Several pages cite `plans/bench/core_bench/` and `plans/symgc-patches/` "of the dmd repository":
+that is the repository this work was developed in, which also holds the DMD and LDC changes. The benchmark programs
+and the correctness tests cited from there are copied into `bench/` of this repository, with scripts that need no
+other checkout (`bench/README.md`). The patch notes, with the measurement behind each change, stay in the development
+repository.
+
 ## What it does, in numbers
 
 The bullet-hell stress test (2 GiB level, 100,000 bullets per second, no pools, 30 s at 60 fps) on a Ryzen 7 3800X
@@ -37,12 +43,13 @@ The rest, including game models with six job threads and 8 GiB heaps, is in `ben
 
 | File | What it covers |
 |---|---|
+| `usage.md` | Every way to use it in one page: dub, one compiler command, run-time selection, the project's DMD, LDC and DMD with the card barrier; short recipes |
 | `integration.md` | Adding it to a project with dub, DMD, LDC or GDC; selecting it; options; checking it runs; troubleshooting |
 | `writing-code.md` | What to write and what to avoid; the frame loop, audio threads and loading screens; rules for C libraries |
 | `how-it-works.md` | The allocator, a collection cycle step by step, write tracking, what still pauses, finalizers |
 | `platforms.md` | Compilers and operating systems: what is checked, what is expected, what blocks |
 | `android.md` | The plan for the first Android session: what is done, what to build and run, what an emulator can and cannot test. Untested |
-| `benchmarks.md` | All numbers, with the commands that produced them |
+| `benchmarks.md` | All numbers, with the commands that produced them (`../BENCHMARKS.md` is the short version; `../bench/` runs them) |
 | `testing.md` | How to help: what to run, the correctness battery, the report template |
 
 ## Five-minute start (Linux, DMD 2.112+)

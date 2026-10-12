@@ -219,6 +219,37 @@ added after that measurement and was checked on this run (memory back to 1.7 GB)
 but not on the other models. Where the heap's growth during a mark comes from (about 50,000 pages a second at 1 GiB,
 regardless of the program's own allocation, which is about 6,000 pages in the same time) is not explained yet.
 
+### Update: the growth was the mark's own work list
+
+The growth during the mark has an explanation, and it was not the program. The scanner's work list is allocated from
+the collector's own heap, and it grows by realloc (a quarter more each time). A concurrent mark frees nothing in the
+heap (a free during the mark is left for the next collection, since the mark may hold the block), so every step of the
+growth stayed: 17 reallocations from 512 to 8,192 pages, 50,432 pages (197 MiB) of garbage per cycle for a final list
+of 32 MiB, counted as heap growth. The 70,000 pages above were about 50,000 of those and about 3,000 of the
+program's own allocation (the trace `gcgrowth` lines now print both). The list now lives in its own mapping, grown by
+doubling, and goes back to the OS at once (`scanner.d`, Posix; Windows keeps the heap list, untested).
+
+With the fix, same binary and parameters as the table above, 60 s runs, two runs each:
+
+| Run | Limit | Frames over 16 ms | Worst frame | Frames over 5 ms | Peak RSS |
+|---|---|---|---|---|---|
+| 1 GiB, 11 MB/s | follows the mark | 0 and 0 | 7.1 and 4.7 ms | 10 and 0 | 1.44-1.47 GB |
+| | fixed | 0 and 0 | 6.4 and 8.9 ms | 5 and 4 | 1.45 GB |
+| 1 GiB, 115 MB/s | follows the mark | 0 and 0 | 12.1 and 14.6 ms | all (frames take 6 ms) | 6.2-6.3 GB |
+| | fixed | 0 and 0 | 13.5 and 13.0 ms | all | 6.2-6.4 GB |
+
+Against the table above: the first mark after building the scene no longer waits (0.64 s worst became 7 ms), the
+115 MB/s run went from 8-10 frames over 16 ms and a worst frame of 1.5-1.9 s to none and 13 ms, and the peak memory
+fell by 0.4 GB and 0.7 GB. The adaptive limit makes no measurable difference any more: it was compensating for the
+work list. It stays on (it follows real growth now, and costs nothing), but it has no measured benefit and is a
+candidate for removal. The overload case is still overloaded: 512 MiB, unpaced, 20,000 entities created per frame
+(about 230 MB/s), one run each: the old collector's worst frame was 5.4 s with 7.6 GB, the new one's 3.8 s with 8.2 GB
+(8.5 GB with the adaptive limit). The existing 500k city, run again against the collector without this fix, in the
+same session: worst frame 10.3 and 11.2 ms before, 11.7 and 10.4 ms after (the machine was slower than in the
+session of the tables above, whose city worst frame was 9.7 ms). The 2 GiB stress still has a worst frame of 1.16 ms,
+and the correctness battery passes (`mark_race` 11.6M moves, `mark_race_glue` 2.6M, `finalizer_order`, `thread_exit_race`), and the collector still
+compiles for Android, Windows and arm64 Linux (not run there).
+
 ## Reproducing
 
 ```sh
