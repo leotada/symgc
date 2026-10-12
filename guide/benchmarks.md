@@ -158,6 +158,10 @@ Same machine, DMD -O -release -inline, druntime and Phobos built with the flag (
 in place (a subtract, a shift, a compare and a byte store, with no call), which brought it level with LDC's
 (class field 1.30 ns in both); the first version called `_d_gcBarrier` and cost +0.9 to +1.4 ns, so the gain of
 expanding it is modest, about 0.2 ns, because the cost is mostly the loads of the window and the store to the table.
+Three or more pointer stores in a row to one object (`t.a = x; t.b = x; t.c = x;`) share one barrier for the lowest
+and the highest address (at most 511 bytes apart), after the last of them: four field stores cost 0.68 ns each
+without it and 0.46 ns with it. Two stores cost as much with a shared barrier as with two, so they keep their own.
+A call, a store of something else, or a different base variable ends the run.
 Copies and stores of slices, delegates and structs still call `_d_gcBarrierRange`. Stores of ints, to the stack
 and to globals are unchanged. The instrumented druntime is about 1% larger and Phobos 0.3%.
 
