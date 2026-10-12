@@ -41,6 +41,7 @@ The rest, including game models with six job threads and 8 GiB heaps, is in `ben
 | `writing-code.md` | What to write and what to avoid; the frame loop, audio threads and loading screens; rules for C libraries |
 | `how-it-works.md` | The allocator, a collection cycle step by step, write tracking, what still pauses, finalizers |
 | `platforms.md` | Compilers and operating systems: what is checked, what is expected, what blocks |
+| `android.md` | The plan for the first Android session: what is done, what to build and run, what an emulator can and cannot test. Untested |
 | `benchmarks.md` | All numbers, with the commands that produced them |
 | `testing.md` | How to help: what to run, the correctness battery, the report template |
 
