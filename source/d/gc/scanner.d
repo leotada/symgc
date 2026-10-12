@@ -691,14 +691,21 @@ public:
 			size *= 2;
 		}
 
+		void* p = null;
 		version(Posix) {
 			import core.sys.posix.sys.mman;
-			auto p = mmap(null, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+			p = mmap(null, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 			if (p == MAP_FAILED) {
 				return null;
 			}
+		} else version(Windows) {
+			import core.sys.windows.winbase : VirtualAlloc;
+			import core.sys.windows.winnt : MEM_RESERVE, MEM_COMMIT, PAGE_READWRITE;
+			p = VirtualAlloc(null, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+			if (p is null) {
+				return null;
+			}
 		} else {
-			// The concurrent mark is Linux only: nothing to copy for.
 			return null;
 		}
 

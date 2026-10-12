@@ -120,6 +120,35 @@ and oneday is 8.6 times faster. The fragmentation workload is the weak spot: one
 about 3 s in collection work against 0.11 s for druntime's GC; where that time goes has not been measured yet.
 Single-thread throughput and `frag` are both open items.
 
+## The cost of the range-checked barrier
+
+The card barrier checks that the address it marks is inside the collector's window (`how-it-works.md`, "The card
+window"). That is one more compare and one more load per store, which is what lets one barrier serve Android (tagged
+pointers), Windows and the others. Measured on 2026-10-12 against the barrier without the check, with the same
+program, same machine and CPU setting, pinned to one core, medians of five runs, LDC -O3
+(`barrier_micro.d`, ns per operation):
+
+| Store pattern | No barrier | Without the check | With the check | Check vs without |
+|---|---|---|---|---|
+| Pointer array element | 0.14 | 0.45 | 0.49 | +9% |
+| Class field | 0.58 | 1.30 | 1.30 | 0% |
+| Two fields of an object | 0.35 | 0.97 | 0.97 | 0% |
+| Two fields of a struct | 0.28 | 0.91 | 0.91 | 0% |
+| Linked list | 0.77 | 1.30 | 1.30 | 0% |
+| Copy of 8 pointers | 2.66 | 7.81 | 8.20 | +5% |
+| Copy of 64 pointers | 6.86 | 12.87 | 14.82 | +15% |
+| Copy of 1,024 pointers | 72.95 | 71.35 | 73.15 | +3% |
+| Append pointers (library) | 20.92 | 20.82 | 22.30 | +7% |
+| AA insert, pointer values (library) | 33.56 | 33.47 | 34.17 | +2% |
+
+The two loads are invariant and are hoisted out of loops, which is why a loop of field stores does not slow down.
+Short copies pay a little more: a check, then a call that clips the range. Two stores to the same object share one
+check. The controls (stores of ints, to the stack, to globals) are unchanged.
+
+On real workloads, run back to back in the same session (LDC + cards), the check changes nothing you can measure: stress test 2 GiB worst frame 0.67-0.72 ms with the check against 0.67-0.89 ms without; 8 GiB 0.89-1.35 ms
+against 0.91-0.97 ms (and one 8.5 ms outlier in the unchecked runs); 500k city p50 2.68-2.95 ms against 2.86-3.06 ms,
+worst 7.3-8.3 ms against 8.3-8.4 ms; no frame over 16 ms in any run.
+
 ## Reproducing
 
 ```sh

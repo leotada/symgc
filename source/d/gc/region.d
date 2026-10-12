@@ -72,7 +72,29 @@ private:
 	// Count of blocks that are currently acquired.
 	size_t nBlocks = 0;
 
+	version(Symgc_cards) {
+		// The memory that holds pointers comes from one contiguous reservation
+		// (see d.gc.cards), so that the card table covers it and nothing more.
+		// It is handed out in chunks as the heap grows.
+		void* windowNext;
+		void* windowEnd;
+	}
+
 public:
+	version(Symgc_cards) {
+		/**
+		 * Reserve the window, and set up the card table for it. Called when
+		 * the collector starts, before the program can store a pointer into
+		 * the collector's memory.
+		 */
+		void reserveWindow() shared {
+			mutex.lock();
+			scope(exit) mutex.unlock();
+
+			(cast(RegionAllocator*) &this).reserveWindowImpl();
+		}
+	}
+
 	bool acquire(ref void* blockAddress, uint extraBlocks = 0) shared {
 		mutex.lock();
 		scope(exit) mutex.unlock();
@@ -248,6 +270,36 @@ private:
 		regionsByRange.insert(r);
 	}
 
+	version(Symgc_cards) {
+		void reserveWindowImpl() {
+			assert(mutex.isHeld(), "Mutex not held!");
+			assert(trackDirty, "Only the pointer allocator has a window!");
+
+			if (windowNext !is null) {
+				return;
+			}
+
+			import d.gc.cards;
+			auto size = windowSizeWanted();
+
+			// A machine with a small address space may not have what we ask
+			// for: ask for less, down to a floor.
+			void* ptr = base.reserveAddressSpace(size, BlockSize);
+			while (ptr is null && size > WindowMinimum) {
+				size = alignDown(size / 2, WindowGranule);
+				ptr = base.reserveAddressSpace(size, BlockSize);
+			}
+
+			if (ptr is null) {
+				cardsFatal("cannot reserve address space for the heap");
+			}
+
+			cardsInit(ptr, size);
+			windowNext = ptr;
+			windowEnd = ptr + size;
+		}
+	}
+
 	Region* refillAddressSpace(uint extraBlocks) {
 		assert(mutex.isHeld(), "Mutex not held!");
 
@@ -259,7 +311,22 @@ private:
 		auto blocks = alignUp(extraBlocks + 1, RefillBlockCount);
 		auto size = blocks * BlockSize;
 
-		auto ptr = base.reserveAddressSpace(size, BlockSize);
+		void* ptr = null;
+		version(Symgc_cards) {
+			if (trackDirty) {
+				// Out of window: the program has used all it reserved.
+				if (windowNext !is null
+					    && size <= cast(size_t) (windowEnd - windowNext)) {
+					ptr = windowNext;
+					windowNext += size;
+				}
+			} else {
+				ptr = base.reserveAddressSpace(size, BlockSize);
+			}
+		} else {
+			ptr = base.reserveAddressSpace(size, BlockSize);
+		}
+
 		if (ptr is null) {
 			unusedRegions.insert(r);
 			return null;

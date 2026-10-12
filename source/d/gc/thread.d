@@ -12,6 +12,13 @@ void createProcess() {
 	Arena.initializeArenaStorage(gBase);
 	gExtentMap.initialize(gBase);
 
+	// The memory that holds pointers, and the card table that covers it, exist
+	// from here on: before main, so before any barrier has run.
+	version(Symgc_cards) {
+		import d.gc.region;
+		gPointerRegionAllocator.reserveWindow();
+	}
+
 	enterBusyState();
 	scope(exit) exitBusyState();
 

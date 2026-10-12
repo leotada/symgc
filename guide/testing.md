@@ -47,6 +47,7 @@ In `plans/bench/core_bench/`:
 | `finalizer_order.d` | A destructor never sees another dead object's memory reused |
 | `phobos_stress.d` | A mix of Phobos code allocating from several threads runs clean |
 | `thread_exit_race.d` | Threads exiting during a concurrent mark do not crash it |
+| `cards_window.d` (run it with `cards_window.sh`) | With the card barrier: the window exists before `main` and holds the memory with pointers; a store marks its card and only that one; stores and copies to `malloc` memory, ranges at odd addresses (below and above the window, with a tag in the top byte) mark nothing; a range running past the end is cut; the collector settles for a smaller window when the address space is limited. Run it first on any new platform |
 
 And the collector's unit tests, from the dmd repository root:
 

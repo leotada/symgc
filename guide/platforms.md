@@ -32,11 +32,32 @@ poses as a placeholder thread while it scans (`core/thread/symthread.d`), which 
 | OS | Upstream symgc | oneday | Write tracking available | Known blockers |
 |---|---|---|---|---|
 | Linux x86-64 | Supported | Measured (every number in `benchmarks.md`) | Cards (patched LDC); kernel tracker on 6.7+ | None |
-| Linux arm64 | Tested upstream (4 KiB pages) | Never built | Cards expected to work; the kernel tracker hard-codes x86-64 syscall numbers | The syscall numbers in `d/gc/dirty.d` |
-| Windows x64 | Supported with DMD 2.112+ | Code written (card table with `VirtualAlloc`, `.CRT$XCU` start-up), never built | Cards (patched LDC); a `GetWriteWatch` tracker is planned | Untested |
-| macOS (Intel, Apple Silicon) | Unknown | Code written (`__mod_init_func` start-up, Darwin `mmap`), never built | Cards (patched LDC) | Untested; DMD only targets Intel |
-| Android arm64 | Unknown | Never built | Cards (patched LDC) | The barrier does not mask tagged pointers (Android 11+); the card table is set up from `.preinit_array`, which shared libraries ignore; the 256 GiB table does not fit 39-bit address spaces |
-| iOS | Unknown | Never built | Cards (patched LDC), after the Android fixes | Same as Android, plus Apple's limits on virtual memory |
+| Linux arm64 | Tested upstream (4 KiB pages) | Compiles, with the card barrier (checked 2026-10-12). Never run | Cards (patched LDC); the kernel tracker is x86-64 only (`d/gc/dirty.d` hard-codes its syscall numbers) | Needs a machine or an emulator to run the battery |
+| Windows x64 | Supported with DMD 2.112+ | Compiles for `x86_64-windows-msvc`, with the card barrier (checked 2026-10-12). Never linked or run | Cards (patched LDC); a `GetWriteWatch` tracker is planned | Needs a Windows machine; pacing sleeps are coarse (see below) |
+| macOS (Intel, Apple Silicon) | Unknown | Does **not** compile | Cards (patched LDC) | No `Waiter` (no futex on Darwin), and the stop-the-world protocol is Linux (signals) or Windows only: see "macOS and iOS" below |
+| Android arm64 | Unknown | Compiles for `aarch64-linux-android`, with the card barrier (checked 2026-10-12). Never linked or run | Cards (patched LDC) | Needs an NDK, a runtime cross-built for Android, and a device or emulator. The barrier and the card table are ready for it (tagged pointers, `.so` start-up, 39-bit address spaces: see `how-it-works.md`) |
+| iOS | Unknown | Does **not** compile (same as macOS) | Cards (patched LDC), after the macOS work | Same as macOS, plus Apple's limits on virtual memory |
+
+"Compiles" means the whole collector builds with `ldc2 -mtriple=<target> -c -gc-card-marking
+-d-version=Symgc_cards`; it says nothing yet about running. Before 2026-10-12 the Windows, Android and macOS code had
+never been compiled for its target. Compiling it found, and fixed: the Windows constants imported from the wrong
+module; `usleep` and a scoping error in code written for Linux only; `sched_getcpu`, which Android only has from API
+level 29 (a thread now picks its arena from its id there).
+
+### macOS and iOS
+
+Two pieces are missing, both inside the collector:
+
+1. **A waiter.** `d/sync/waiter.d` has a futex implementation for Linux and a `WaitOnAddress` one for Windows. Darwin
+   has neither. A futex can be emulated with a table of `pthread` mutexes and condition variables keyed by address
+   (the compare-and-wait done under the bucket's lock), which keeps `FutexWaiter` unchanged.
+2. **Stopping the threads.** On Linux the collector signals each thread and waits for it to reach a safe point; on
+   Windows it suspends it and checks that it is not inside the collector. druntime stops Darwin threads with Mach
+   `thread_suspend`, so the Windows-style protocol is the natural base, but it relies on Win32 events in
+   `d/gc/thread.d` (`waitForGCBusy`, delayed threads) that need a Darwin counterpart.
+
+Neither can be tested without a Mac, so neither is written yet. The card barrier itself is ready for both: it is plain
+LLVM IR and its table is set up with `mmap`.
 
 Without write tracking the collector still works everywhere it builds: the mark stops the program, and the sweep
 runs beside it.
@@ -54,8 +75,14 @@ for every target they support, is in `plans/cross_platform_gc_plan.md` of the dm
 
 ## Machine requirements
 
-* With cards: the card table reserves 256 GiB (+2 GiB summary) of address space with `MAP_NORESERVE`, so
-  `vm.overcommit_memory` must be 0 or 1.
+* With cards: the collector reserves the address space for its pointer-holding memory (the window) when it starts,
+  256 GiB on a desktop and 16 GiB on Android and iOS, plus a card table of 1/512 of it (512 MiB and 32 MiB). On Posix
+  that is `MAP_NORESERVE`, so `vm.overcommit_memory` must be 0 or 1; on Windows it is `MEM_RESERVE`, which costs no
+  memory. If the system will not give that much, the collector asks for half, down to 2 GiB.
+  `SYMGC_HEAP_RESERVE_GIB` sets the first request. A program cannot grow its pointer-holding heap past the window.
+* Windows pacing: the sweeper and the helpers sleep for 50 to 100 microseconds on Posix. Windows sleeps in ticks of the
+  system timer (a millisecond at best), so a shorter wait yields the core instead, which spins a little; a high
+  resolution waitable timer would be better and has not been tried.
 * Kernel tracker: Linux 6.7+ with `userfaultfd` available to unprivileged processes in user mode
   (`UFFD_USER_MODE_ONLY`, the default on most distributions). If it is not available, the collector falls back to the
   stop-the-world mark without telling you; `SYMGC_DIRTY=0` forces that fallback for comparisons.

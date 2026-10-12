@@ -626,8 +626,8 @@ public:
 
 		auto t0 = getMonotonicTime();
 
-		import core.sys.posix.unistd : usleep;
-		usleep(cast(uint) (owed / 10));
+		import d.gc.time : sleepMicros;
+		sleepMicros(cast(uint) (owed / 10));
 
 		auto slept = getMonotonicTime() - t0;
 		return slept >= owed ? 0 : owed - slept;

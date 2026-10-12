@@ -107,30 +107,16 @@ void pages_commit(void* addr, size_t size) {
 		if (ret !is null) {
 			assert(ret is addr, "MEM_COMMIT moved alloction!");
 			version(Symgc_cards) {
-				import d.gc.cards : __sd_gc_card_base, CardShift;
-				if (__sd_gc_card_base !is null) {
-					size_t cardOffset = (cast(size_t) addr) >> CardShift;
-					size_t cardBytes = (size >> CardShift);
-					if (cardBytes == 0) cardBytes = 1;
-					size_t alignedOffset = cardOffset & ~4095UL;
-					size_t alignedBytes = ((cardOffset + cardBytes + 4095UL) & ~4095UL) - alignedOffset;
-					VirtualAlloc(__sd_gc_card_base + alignedOffset, alignedBytes, MEM_COMMIT, PAGE_READWRITE);
-				}
+				import d.gc.cards : cardsCommit;
+				cardsCommit(addr, size);
 			}
 			return;
 		}
 
 		if (applyPerReservation(VmOp.commit, addr, size)) {
 			version(Symgc_cards) {
-				import d.gc.cards : __sd_gc_card_base, CardShift;
-				if (__sd_gc_card_base !is null) {
-					size_t cardOffset = (cast(size_t) addr) >> CardShift;
-					size_t cardBytes = (size >> CardShift);
-					if (cardBytes == 0) cardBytes = 1;
-					size_t alignedOffset = cardOffset & ~4095UL;
-					size_t alignedBytes = ((cardOffset + cardBytes + 4095UL) & ~4095UL) - alignedOffset;
-					VirtualAlloc(__sd_gc_card_base + alignedOffset, alignedBytes, MEM_COMMIT, PAGE_READWRITE);
-				}
+				import d.gc.cards : cardsCommit;
+				cardsCommit(addr, size);
 			}
 			return;
 		}
@@ -309,18 +295,8 @@ void pages_purge(void* addr, size_t size) {
 		assert(ret == 0, "madvise failed!");
 	} else version(Windows) {
 		version(Symgc_cards) {
-			import d.gc.cards : __sd_gc_card_base, CardShift;
-			if (__sd_gc_card_base !is null) {
-				size_t cardOffset = (cast(size_t) addr) >> CardShift;
-				size_t cardBytes = (size >> CardShift);
-				if (cardBytes > 0) {
-					size_t alignedOffset = cardOffset & ~4095UL;
-					size_t alignedBytes = (cardBytes & ~4095UL);
-					if (alignedBytes > 0) {
-						VirtualFree(__sd_gc_card_base + alignedOffset, alignedBytes, MEM_DECOMMIT);
-					}
-				}
-			}
+			import d.gc.cards : cardsDecommit;
+			cardsDecommit(addr, size);
 		}
 
 		/**

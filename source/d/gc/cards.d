@@ -5,22 +5,39 @@ module d.gc.cards;
  *
  * With `-version=Symgc_cards` the collector does not ask the kernel which
  * pages were written (d.gc.dirty); the compiler says so. Code built with
- * ldc2 `-gc-card-marking` sets one byte in the card table, `base[addr >> 9]`,
- * after each store of a pointer to memory that is not on the stack or a
- * global, and after each memcpy/memmove to such memory. The collector reads
- * and clears the table to find the 512 byte cards to scan again.
+ * ldc2 `-gc-card-marking` sets one byte in the card table after each store of
+ * a pointer to memory that is not on the stack or a global, and after each
+ * memcpy/memmove to such memory. The collector reads and clears the table to
+ * find the 512 byte cards to scan again.
  *
  * Compared to the kernel route: a store that is not a pointer (a float in an
  * object that is written every frame) dirties nothing, nothing faults after a
  * collection cycle starts, and the pause only depends on the pointers the
- * program wrote. The price: every store of a pointer costs three more
+ * program wrote. The price: every store of a pointer costs a few more
  * instructions, and writes that do not come from instrumented code (a C
  * library, `read()` into a buffer) are not seen.
+ *
+ * The memory that holds the program's pointers is one contiguous range, the
+ * window: [`__sd_gc_card_lo`, `__sd_gc_card_lo` + `__sd_gc_card_n` * 512). The
+ * card table covers the window and nothing else, so its size follows the heap
+ * the program can have, not the address space of the machine (a phone with 39
+ * bits of address space cannot give 256 GiB to a table). The barrier is range
+ * checked:
+ *
+ *     if ((addr - lo) >> 9 < n) base[(addr - lo) >> 9] = 1;
+ *
+ * so a store to memory outside the window (malloc, a pointer with a tag in
+ * its top byte, as the Android allocator hands out) costs a compare and marks
+ * nothing. `lo`, `n` and `base` are zero until the collector starts: until
+ * then every barrier is a no-op, which is right, because no memory of the
+ * collector exists. The tables are set up when the collector starts, before
+ * `main`, not by a constructor that has to run before every other one, which
+ * is what `.preinit_array` was for and what a shared library cannot have.
  */
 
-
 version(Windows) {
-	import core.sys.windows.winbase : VirtualAlloc, MEM_RESERVE, MEM_COMMIT, PAGE_READWRITE;
+	import core.sys.windows.winbase : VirtualAlloc, VirtualFree;
+	import core.sys.windows.winnt : MEM_RESERVE, MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE;
 } else version(Posix) {
 	version(linux) {
 		import core.sys.linux.sys.mman;
@@ -44,66 +61,147 @@ enum CardSize = size_t(1) << CardShift;
 // cards, which is what keeps the pause small for a heap of many GiB.
 enum SummaryShift = 16;
 enum CardsPerSummary = size_t(1) << (SummaryShift - CardShift);
-enum SummarySize = size_t(1) << (47 - SummaryShift);
-
-// The whole user address space: 2^47 bytes of addresses, one byte per card.
-enum TableSize = size_t(1) << (47 - CardShift);
 
 /**
- * The code the compiler emits loads this on each barrier, and indexes it
- * with `address >> CardShift`.
+ * What the code the compiler emits loads on each barrier.
  */
+extern(C) __gshared size_t __sd_gc_card_lo;
+extern(C) __gshared size_t __sd_gc_card_n;
 extern(C) __gshared ubyte* __sd_gc_card_base;
 extern(C) __gshared ubyte* __sd_gc_card_summary_base;
 
+// The window is carved in blocks of this many bytes (see d.gc.region).
+enum WindowGranule = size_t(1) << 30;
+
 /**
- * Mapped before any code that stores a pointer runs, not lazily. The
- * constructors of the program run in no defined order, so this goes in
- * `.preinit_array` (Linux/ELF), `__DATA,__mod_init_func` (macOS), or
- * `.CRT$XCU` (Windows), which the dynamic loader runs before all of them.
+ * How much address space to reserve for the memory that holds pointers: the
+ * most the heap can grow to. SYMGC_HEAP_RESERVE_GIB overrides it. The default
+ * leaves room on a machine with a small address space.
  */
-extern(C) void __sd_gc_card_init() {
-	if (__sd_gc_card_base !is null) {
-		return;
+size_t windowSizeWanted() {
+	import core.stdc.stdlib : getenv, atoi;
+
+	if (auto env = getenv("SYMGC_HEAP_RESERVE_GIB")) {
+		auto gib = atoi(env);
+		if (gib > 0) {
+			return size_t(gib) * WindowGranule;
+		}
 	}
 
-	version(Windows) {
-		auto q = VirtualAlloc(null, SummarySize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-		if (q is null) {
-			import core.stdc.stdio : fputs, stderr;
-			import core.stdc.stdlib : abort;
-			fputs("symgc: cannot map the card summary\n", stderr);
-			abort();
-		}
-		__sd_gc_card_summary_base = cast(ubyte*) q;
+	// A phone has 39 bits of address space on many devices (512 GiB for
+	// everything: libraries, stacks, the GPU driver's mappings).
+	version(Android) {
+		enum DefaultGiB = 16;
+	} else version(iOS) {
+		enum DefaultGiB = 16;
+	} else version(D_LP64) {
+		enum DefaultGiB = 256;
+	} else {
+		enum DefaultGiB = 1;
+	}
 
-		auto p = VirtualAlloc(null, TableSize, MEM_RESERVE, PAGE_READWRITE);
-		if (p is null) {
-			import core.stdc.stdio : fputs, stderr;
-			import core.stdc.stdlib : abort;
-			fputs("symgc: cannot map the card table\n", stderr);
-			abort();
-		}
-		__sd_gc_card_base = cast(ubyte*) p;
+	return size_t(DefaultGiB) * WindowGranule;
+}
+
+/// The smallest window worth having: smaller than this and the program is
+/// better off failing at start-up than running out of heap a minute in.
+enum WindowMinimum = size_t(2) * WindowGranule;
+
+void cardsFatal(string msg) {
+	import core.stdc.stdio : fprintf, stderr;
+	import core.stdc.stdlib : abort;
+	fprintf(stderr, "symgc: %.*s\n", cast(int) msg.length, msg.ptr);
+	abort();
+}
+
+private void* mapTable(size_t size) {
+	version(Windows) {
+		// Reserved here, committed with the memory it covers (cardsCommit).
+		return VirtualAlloc(null, size, MEM_RESERVE, PAGE_READWRITE);
 	} else version(Posix) {
 		enum Flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
-		auto q = mmap(null, SummarySize, PROT_READ | PROT_WRITE, Flags, -1, 0);
-		if (q is MAP_FAILED) {
-			import core.stdc.stdio : fputs, stderr;
-			import core.stdc.stdlib : abort;
-			fputs("symgc: cannot map the card summary\n", stderr);
-			abort();
-		}
-		__sd_gc_card_summary_base = cast(ubyte*) q;
+		auto p = mmap(null, size, PROT_READ | PROT_WRITE, Flags, -1, 0);
+		return p is MAP_FAILED ? null : p;
+	}
+}
 
-		auto p = mmap(null, TableSize, PROT_READ | PROT_WRITE, Flags, -1, 0);
-		if (p is MAP_FAILED) {
-			import core.stdc.stdio : fputs, stderr;
-			import core.stdc.stdlib : abort;
-			fputs("symgc: cannot map the card table\n", stderr);
-			abort();
+/**
+ * Set up the tables for a window the collector has reserved. Called once,
+ * before any pointer is stored into the window's memory, from the thread that
+ * starts the collector.
+ */
+void cardsInit(void* lo, size_t size) {
+	assert(__sd_gc_card_base is null, "The card table is already set up!");
+	assert(size % WindowGranule == 0, "Invalid window size!");
+
+	auto cards = mapTable(size >> CardShift);
+	if (cards is null) {
+		cardsFatal("cannot map the card table");
+	}
+
+	// The summary is small (4 MiB for 256 GiB) and mapped even when unused.
+	version(Windows) {
+		auto summary = VirtualAlloc(null, size >> SummaryShift, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+	} else {
+		auto summary = mapTable(size >> SummaryShift);
+	}
+	if (summary is null) {
+		cardsFatal("cannot map the card summary");
+	}
+
+	__sd_gc_card_summary_base = cast(ubyte*) summary;
+	__sd_gc_card_base = cast(ubyte*) cards;
+	__sd_gc_card_lo = cast(size_t) lo;
+
+	// Last: this is what switches the barriers on.
+	atomicStore!(MemoryOrder.rel)(*cast(shared(size_t)*) &__sd_gc_card_n, size >> CardShift);
+}
+
+/**
+ * Where, in the table, are the cards of [addr, addr + size)? Windows commits
+ * the table in step with the memory it covers; elsewhere nothing is needed.
+ */
+version(Windows) {
+	private bool cardSlice(void* addr, size_t size, out size_t first, out size_t bytes) {
+		auto rel = cast(size_t) addr - __sd_gc_card_lo;
+		if (__sd_gc_card_base is null || rel >= (__sd_gc_card_n << CardShift)) {
+			return false;
 		}
-		__sd_gc_card_base = cast(ubyte*) p;
+
+		first = rel >> CardShift;
+		bytes = size >> CardShift;
+		return true;
+	}
+
+	void cardsCommit(void* addr, size_t size) {
+		size_t first, bytes;
+		if (!cardSlice(addr, size, first, bytes)) {
+			return;
+		}
+
+		if (bytes == 0) {
+			bytes = 1;
+		}
+
+		// Whole pages of the table that cover the cards.
+		auto from = first & ~4095UL;
+		auto to = (first + bytes + 4095UL) & ~4095UL;
+		VirtualAlloc(__sd_gc_card_base + from, to - from, MEM_COMMIT, PAGE_READWRITE);
+	}
+
+	void cardsDecommit(void* addr, size_t size) {
+		size_t first, bytes;
+		if (!cardSlice(addr, size, first, bytes) || bytes == 0) {
+			return;
+		}
+
+		// Only the pages of the table that hold nothing but these cards:
+		// the neighbours' cards share the pages at both ends.
+		auto from = (first + 4095UL) & ~4095UL;
+		auto to = (first + bytes) & ~4095UL;
+		if (to > from) {
+			VirtualFree(__sd_gc_card_base + from, to - from, MEM_DECOMMIT);
+		}
 	}
 }
 
@@ -129,8 +227,21 @@ extern(C) void __sd_gc_card_range(void* dst, size_t size) {
 		return;
 	}
 
-	auto first = cast(size_t) dst >> CardShift;
-	auto last = (cast(size_t) dst + size - 1) >> CardShift;
+	// A copy to memory outside the window marks nothing. Objects do not
+	// straddle the window's edges, so one that starts outside is outside.
+	auto limit = __sd_gc_card_n << CardShift;
+	auto rel = cast(size_t) dst - __sd_gc_card_lo;
+	if (rel >= limit) {
+		return;
+	}
+
+	auto lastByte = rel + size - 1;
+	if (lastByte >= limit || lastByte < rel) {
+		lastByte = limit - 1;
+	}
+
+	auto first = rel >> CardShift;
+	auto last = lastByte >> CardShift;
 	auto cards = __sd_gc_card_base;
 	auto sums = __sd_gc_card_summary_base;
 	const bool useSummary = isSummaryEnabled();
@@ -168,15 +279,22 @@ extern(C) void __sd_gc_card_range(void* dst, size_t size) {
 }
 
 /**
- * Read and clear the cards of [start, start + size), calling `dg` with the
- * page aligned runs that cover the dirty ones. Returns the number of pages.
+ * Read and clear the cards of [start, start + size), which lies in the window,
+ * calling `dg` with the page aligned runs that cover the dirty ones. Returns
+ * the number of pages.
  */
 size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*, size_t) dg) {
 	enum PageSize = 4096;
 	enum CardsPerPage = PageSize / CardSize;
 
-	auto lo = start >> CardShift;
-	auto hi = (start + size) >> CardShift;
+	// The window starts on a block boundary, so a card index counted from it
+	// maps to a page address by plain arithmetic.
+	auto windowLo = __sd_gc_card_lo;
+	assert(start >= windowLo && start + size <= windowLo + (__sd_gc_card_n << CardShift),
+	       "Range outside the card window!");
+
+	auto lo = (start - windowLo) >> CardShift;
+	auto hi = (start + size - windowLo) >> CardShift;
 	auto base = __sd_gc_card_base;
 
 	size_t pages = 0;
@@ -195,7 +313,7 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
 	}
 
 	void page(size_t pageIndex) {
-		auto s = pageIndex * PageSize;
+		auto s = windowLo + pageIndex * PageSize;
 		if (s == runHi && runHi != 0) {
 			runHi = s + PageSize;
 			return;
@@ -327,16 +445,4 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
  */
 void clearCards(size_t start, size_t size) {
 	collectCards(start, size, null);
-}
-
-version(LDC) {
-	import ldc.attributes : section;
-
-	version(Windows) {
-		@section(".CRT$XCU") __gshared extern(C) void function() __sd_gc_card_preinit = &__sd_gc_card_init;
-	} else version(OSX) {
-		@section("__DATA,__mod_init_func") __gshared extern(C) void function() __sd_gc_card_preinit = &__sd_gc_card_init;
-	} else {
-		@section(".preinit_array") __gshared extern(C) void function() __sd_gc_card_preinit = &__sd_gc_card_init;
-	}
 }

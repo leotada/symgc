@@ -140,6 +140,7 @@ Environment variables, read at start-up:
 | `SYMGC_SWEEP_DUTY=n` | 50 | Percent of the time the background sweeper may run |
 | `SYMGC_SWEEP_NICE=n` | 10 | Nice value of the sweeper (Linux) |
 | `SYMGC_CARD_SUMMARY=1` | off | With cards: also keep a summary byte per 64 KiB (faster remark at 8 GiB, slower stores with many threads) |
+| `SYMGC_HEAP_RESERVE_GIB=n` | 256 (16 on Android and iOS) | With cards: address space to reserve at start-up for the memory that holds pointers, the most that part of the heap can grow to. The collector halves the request, down to 2 GiB, if the system will not give it |
 
 druntime's own options still apply where they make sense: `--DRT-gcopt=parallel:N` sets the mark threads too.
 
@@ -159,6 +160,7 @@ druntime's own options still apply where they make sense: `--DRT-gcopt=parallel:
 | `tlsGCData was not set for this thread!` (or `SIGILL` in `suspendDruntimeThreads`) | druntime 2.111 (GDC 15) and a second thread | Use a compiler with druntime 2.112+ |
 | `undefined identifier GCTelemetry` | An older checkout of the fork | Update the fork; it builds without this project's druntime since 2026-10-12 |
 | Programs run slower than with druntime's GC | A debug build of the collector | Build with `-b release` (dub) or `-O -release` |
-| The card table cannot be mapped at start-up | `vm.overcommit_memory=2` | Use 0 or 1, or build without cards |
+| `symgc: cannot map the card table` or `cannot reserve address space for the heap` at start-up | `vm.overcommit_memory=2`, or an address-space limit (`ulimit -v`) smaller than 2 GiB plus its card table | Use `vm.overcommit_memory` 0 or 1, raise the limit, or build without cards |
+| Out of memory with plenty of RAM free, built with cards | The program used up the window | Raise `SYMGC_HEAP_RESERVE_GIB` |
 | Long pauses that grow with the heap | No write tracking: kernel older than 6.7, no cards, or `SYMGC_CONCURRENT_MARK=0` | Check the setup table above |
 | A crash or a corrupted object only under oneday | A bug, or C code writing GC pointers into GC memory | Rebuild with `-version=Symgc_verify` and report it (`testing.md`) |

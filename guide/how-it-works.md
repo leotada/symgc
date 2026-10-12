@@ -84,7 +84,7 @@ again. oneday has three ways, chosen once, at the first collection:
 
 | Mode | How it knows what was written | Needs | Cost to the program |
 |---|---|---|---|
-| **Card barrier** | The compiler emits `cards[address >> 9] = 1` after each pointer store; one byte per 512 bytes of memory | LDC built from the `gc-card-marking` branch, everything compiled with `-gc-card-marking`, symgc built with `-version=Symgc_cards` | One byte store per pointer store (0.5 to 1.4 ns in microbenchmarks). Pointer-free stores and copies cost nothing |
+| **Card barrier** | The compiler emits `if ((addr - lo) >> 9 < n) cards[(addr - lo) >> 9] = 1` after each pointer store; one byte per 512 bytes of the collector's memory (see "The card window" below) | LDC built from the `gc-card-marking` branch, everything compiled with `-gc-card-marking`, symgc built with `-version=Symgc_cards` | A compare and a byte store per pointer store (0.5 to 1.4 ns in microbenchmarks). Pointer-free stores and copies cost nothing; a store outside the window costs only the compare |
 | **Kernel dirty pages** | Linux write-protects the pointer-holding heap asynchronously (`userfaultfd` write-protect) and reports written pages (`PAGEMAP_SCAN`) | Linux 6.7 or newer, x86-64; any compiler | A fault of about 1.5 µs on the first write to each page in each cycle |
 | **None** | Nothing: the mark stops the program | Nothing | No barrier cost; the pause is the whole mark, which grows with the heap |
 
@@ -94,6 +94,37 @@ benchmark at 2 GiB that is 10.3 ms against 24.7 ms for upstream symgc's stop-the
 What the card barrier cannot see: pointer writes made by code compiled without `-gc-card-marking`, which includes C
 libraries. C code may hold pointers to GC memory and read through them; that is fine. C code that *writes* a GC
 pointer into GC memory while a mark runs is not seen. The kernel tracker sees every write, C included.
+
+### The card window
+
+With cards, the memory that holds your program's pointers is one contiguous range of address space, the window,
+reserved when the collector starts (before `main`). The card table covers the window and nothing else, one byte per
+512 bytes, so its size follows the heap the program can have and not the address space of the machine: 512 MiB of
+table for a 256 GiB window, 32 MiB for 16 GiB. Memory is only committed as the heap grows and the table is only
+touched where pointers are written.
+
+The barrier is range checked. `lo` is the start of the window and `n` the number of cards in it, both zero until the
+collector starts:
+
+```
+if ((addr - lo) >> 9 < n)  cards[(addr - lo) >> 9] = 1;
+```
+
+Three things follow, and they are what makes the same barrier usable on every platform:
+
+* A store to memory outside the window costs the compare and marks nothing. That is every store into `malloc` memory,
+  and every store through a pointer with a tag in its top byte, which is what Android's allocator returns for malloc
+  memory since Android 11: such an address minus `lo` is enormous, so the compare fails. The collector's own memory
+  is never tagged.
+* Before the collector starts, every barrier is a no-op, so there is nothing that has to run before everyone else's
+  start-up code. The table is set up by the collector itself, and a shared library loaded later (an Android game is
+  one) works the same as an executable.
+* A machine with little address space (many phones have 39 bits, 512 GiB for everything) still runs: the collector
+  asks for the window it wants and halves the request until the system agrees, down to 2 GiB. Run out of the window
+  and the program is out of memory, as it would be at any other heap limit.
+
+Memory that holds pointers but is not in the window (the program's static data, thread stacks, ranges added with
+`GC.addRange`) is not tracked by cards. It is scanned again as a root in the remark pause, as before.
 
 ## What still stops your threads
 
@@ -148,7 +179,9 @@ the others do nothing.
 ## Limits worth knowing
 
 * Measured on Linux x86-64 only. See `platforms.md` for the other systems.
-* With cards, the table reserves 256 GiB (+2 GiB summary) of address space with `MAP_NORESERVE`; this needs
-  `vm.overcommit_memory` 0 or 1, and it does not fit the smaller address spaces of phones yet.
+* With cards, the collector reserves its memory as one window of address space up front (256 GiB on a desktop, 16
+  GiB on Android and iOS, `SYMGC_HEAP_RESERVE_GIB` to change it) and cannot grow past it. The reservation is
+  `MAP_NORESERVE` on Posix, which needs `vm.overcommit_memory` 0 or 1, and `MEM_RESERVE` on Windows, which costs no
+  memory. If the system will not give that much address space, the collector halves the request down to 2 GiB.
 * Objects never move. Slices, interior pointers and pointers held by C stay valid; fragmentation is handled by
   returning empty slabs and pages, not by compaction.

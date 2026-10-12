@@ -133,9 +133,9 @@ struct Collector {
 		 * busy, and is stopped like any other.
 		 */
 		if (gMarkActive.load() != 0) {
-			import core.sys.posix.unistd : usleep;
+			import d.gc.time : sleepMicros;
 			while (gMarkActive.load() != 0 && Arena.computeUsedPageCount() > gSweepHardLimit) {
-				usleep(100);
+				sleepMicros(100);
 			}
 
 			return;
@@ -163,8 +163,8 @@ struct Collector {
 			if (!worked) {
 				// The sweeper is on a part that is not ours (finalizers) or
 				// another thread is in a step: do not fight it for the lock.
-				import core.sys.posix.unistd : usleep;
-				usleep(50);
+				import d.gc.time : sleepMicros;
+				sleepMicros(50);
 			}
 		}
 	}

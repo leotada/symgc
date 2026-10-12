@@ -1223,7 +1223,14 @@ private:
 		 * of glibc thanks to rseqs, but we might want to find
 		 * an alternative on other systems.
 		 */
-		 version(linux) {
+		 version(Android) {
+			// sched_getcpu needs API level 29, and the loader refuses a
+			// library that names a symbol the device does not have. A thread
+			// picks its arena from its id instead: same spread over the
+			// arenas, and a thread keeps its arena for as long as it lives.
+			return cast(uint) tid & ((ArenaCount >> 1) - 1);
+		 }
+		 else version(linux) {
 			import core.sys.linux.sched;
 			return sched_getcpu();
 		 }
