@@ -60,7 +60,9 @@ mark threads (2-6)            [ mark ................... ]
    least 2 and at most 6 (`SYMGC_MARK_THREADS`), at a nice value of 10 on Linux so that game threads win a shared
    core. Objects allocated during the mark are *born live*: they are not traced and not freed this cycle.
 4. **Dirty rounds.** The program kept writing while the mark ran. The GC rescans what was written since, in rounds,
-   until fewer than 512 pages are dirty.
+   until fewer than 512 pages' worth are dirty. With cards the unit rescanned is the card (512 bytes), not the page:
+   a program that writes one pointer into each of many pages (a hash table, a tree) would otherwise make the rounds
+   rescan eight times what it wrote, and they would not converge. The kernel tracker can only say "this page".
 5. **Remark pause.** Stop the threads again, rescan the roots, stacks, thread-local storage and the last dirty
    memory, restart. Typically 0.1 to 0.6 ms at 2 GiB of live data. After it, everything reachable is marked.
 6. **Finalize.** Every finalizer of the cycle runs, in every arena, before any dead slot is reused. A destructor

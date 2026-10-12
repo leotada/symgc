@@ -149,6 +149,33 @@ On real workloads, run back to back in the same session (LDC + cards), the check
 against 0.91-0.97 ms (and one 8.5 ms outlier in the unchecked runs); 500k city p50 2.68-2.95 ms against 2.86-3.06 ms,
 worst 7.3-8.3 ms against 8.3-8.4 ms; no frame over 16 ms in any run.
 
+## DMD with `-preview=gcbarrier`
+
+Same machine, DMD -O -release -inline, druntime and Phobos built with the flag (`integration.md`, section 4).
+
+**Cost per store** (`barrier_micro.d`, pinned, medians of five): a pointer store pays +0.9 to +1.4 ns and a short
+pointer copy +2.3 ns, because the barrier is a call (DMD has no inline expansion of it yet; LDC's costs 0 to 0.5 ns).
+Stores of ints, to the stack and to globals are unchanged. The instrumented druntime is 0.9% larger and Phobos 0.3%.
+
+**Frames, DMD with cards against DMD with the kernel tracker:**
+
+| Workload | DMD + barrier | DMD + kernel tracker |
+|---|---|---|
+| Stress, 2 GiB, worst frame | 1.09-1.16 ms | 1.14-1.27 ms |
+| Stress, 8 GiB, worst frame | 1.66 ms (p50 311 us) | 1.22 ms (p50 214 us) |
+| Bullet hell, 2 GiB, p99.9 / worst | 3.3 / 3.35 ms | 4.0 / 4.3 ms |
+| City, 500k citizens, worst frame | 8.3 ms, none over 16 ms | 9.8 ms |
+
+So the barrier gives DMD what the kernel tracker gives on Linux 6.7+, without needing that kernel, and it is the
+route to the other systems where DMD runs. The price is the median at large heaps (8 GiB: 311 against 214 us).
+
+**The 500k city used to stall for 2 s** with this build. The cause was in the collector, not the barrier: it handed
+the scanner whole 4 KiB pages for each dirty card, and this program writes one pointer into a very large number of
+pages, so a round rescanned eight times what had been written, took 0.15 to 1 s, and the program dirtied more in
+the meantime; rounds of 80k, 150k, 250k, 450k pages never converged. The collector now hands over cards (512
+bytes), and rounds shrink (7-10k pages, then about 1k). LDC with cards went from 6.9 to 6.1 ms worst at the same
+time. Not re-run after this change: the 8 GiB stress and the bullet hell in the table above.
+
 ## Reproducing
 
 ```sh

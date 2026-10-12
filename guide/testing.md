@@ -48,6 +48,12 @@ In `plans/bench/core_bench/`:
 | `phobos_stress.d` | A mix of Phobos code allocating from several threads runs clean |
 | `thread_exit_race.d` | Threads exiting during a concurrent mark do not crash it |
 | `cards_window.d` (run it with `cards_window.sh`) | With the card barrier: the window exists before `main` and holds the memory with pointers; a store marks its card and only that one; stores and copies to `malloc` memory, ranges at odd addresses (below and above the window, with a tag in the top byte) mark nothing; a range running past the end is cut; the collector settles for a smaller window when the address space is limited. Run it first on any new platform |
+| `mark_race_glue.d` | Eight ways of storing a pointer into a node (field, element, array literal, struct literal, closure, `atomicStore`, `cas`, a copy) lose nothing. Built without the barrier it reports 1,600 to 1,900 violations in a run. The test for a compiler's barrier pass |
+| `cards_precision.d` | The barrier marks the cards of what was written and no others: an array, a field of every object, a struct array, a copy, the same field 100,000 times, a neighbour nobody wrote to. A barrier that marks more makes the collector rescan for nothing |
+| `gcbarrier_codegen_check.sh` | DMD only: counts the calls to the barrier in small functions (a field store has one, an int store none, a global none, an array literal one per element); run with and without `EXTRA=-fPIC` |
+
+DMD with the barrier is built with `plans/bench/core_bench/dmd_gcbarrier.sh build OUT FILE.d`, which links the
+instrumented druntime and Phobos; run the programs with `--DRT-gcopt=gc:sdcq`.
 
 And the collector's unit tests, from the dmd repository root:
 

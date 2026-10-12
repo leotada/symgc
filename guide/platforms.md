@@ -16,6 +16,7 @@ see `testing.md`.
 | LDC with a 2.112+ frontend, stock | ≥ 2.112 | Supported by upstream | Builds | Kernel tracker expected, as above | — | Expected; please report |
 | DMD 2.113 from this project (patched druntime) | 2.113 | Works | Works | Kernel tracker, Linux 6.7+ | — | Checked |
 | LDC 1.43-git from this project (`gc-card-marking`) | 2.113 | Does not run on this runtime | Works | Cards, or the kernel tracker | Yes | Checked |
+| DMD 2.113 from this project, `-preview=gcbarrier` | 2.113 | Does not run on this runtime | Works | Cards, on Linux x86-64 (the only target DMD builds for) | Yes, a call per pointer store | Checked |
 
 **Why GDC 15 fails:** its druntime (2.111) has `tlsGCData` but not the GC's thread-init hook, which druntime gained
 in April 2025 (2.112). The collector never learns about the threads druntime starts and asserts when it tries to
@@ -70,8 +71,11 @@ runs beside it.
 | LDC | Yes | Yes | Yes | Yes | Yes | Yes | Yes, less tested |
 | GDC | Yes | Yes | MinGW | Unknown | Unknown | No | No |
 
-Phones mean LDC. The plan to make the barrier come from the shared D frontend, so that DMD, LDC and GDC all emit it
-for every target they support, is in `plans/cross_platform_gc_plan.md` of the dmd repository.
+Phones mean LDC. The barrier is not emitted by the shared frontend: a frontend rewrite would miss the pointer stores
+the code generator makes by itself (the elements of an array literal, a struct literal, a closure frame). What the
+compilers share is the switch, the card ABI and the two druntime functions; each backend has a pass of its own: an
+LLVM pass in LDC (done), a pass over the element trees in DMD (done, `backend/gcbarrier.d`), a GIMPLE pass for GDC
+(not started). The plan is in `plans/cross_platform_gc_plan.md` of the dmd repository.
 
 ## Machine requirements
 
