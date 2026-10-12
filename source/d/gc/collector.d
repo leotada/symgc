@@ -134,6 +134,12 @@ struct Collector {
 		 */
 		if (gMarkActive.load() != 0) {
 			import d.gc.time : sleepMicros;
+			version(Symgc_phase_trace) {
+				import core.stdc.stdio : fprintf, stderr;
+				fprintf(stderr, "gcwait: mark active, used=%zu pages over hardLimit=%zu pages\n",
+				        cast(size_t) Arena.computeUsedPageCount(), cast(size_t) gSweepHardLimit);
+			}
+
 			while (gMarkActive.load() != 0 && Arena.computeUsedPageCount() > gSweepHardLimit) {
 				sleepMicros(100);
 			}
