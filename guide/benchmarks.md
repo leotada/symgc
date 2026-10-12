@@ -153,21 +153,26 @@ worst 7.3-8.3 ms against 8.3-8.4 ms; no frame over 16 ms in any run.
 
 Same machine, DMD -O -release -inline, druntime and Phobos built with the flag (`integration.md`, section 4).
 
-**Cost per store** (`barrier_micro.d`, pinned, medians of five): a pointer store pays +0.9 to +1.4 ns and a short
-pointer copy +2.3 ns, because the barrier is a call (DMD has no inline expansion of it yet; LDC's costs 0 to 0.5 ns).
-Stores of ints, to the stack and to globals are unchanged. The instrumented druntime is 0.9% larger and Phobos 0.3%.
+**Cost per store** (`barrier_micro.d`, pinned, medians of five), DMD against DMD without the flag: a class field
+0.61 -> 1.30 ns, a linked list 0.73 -> 1.80 ns, an array element 0.28 -> 1.29 ns. The single-store barrier is expanded
+in place (a subtract, a shift, a compare and a byte store, with no call), which brought it level with LDC's
+(class field 1.30 ns in both); the first version called `_d_gcBarrier` and cost +0.9 to +1.4 ns, so the gain of
+expanding it is modest, about 0.2 ns, because the cost is mostly the loads of the window and the store to the table.
+Copies and stores of slices, delegates and structs still call `_d_gcBarrierRange`. Stores of ints, to the stack
+and to globals are unchanged. The instrumented druntime is about 1% larger and Phobos 0.3%.
 
 **Frames, DMD with cards against DMD with the kernel tracker:**
 
 | Workload | DMD + barrier | DMD + kernel tracker |
 |---|---|---|
-| Stress, 2 GiB, worst frame | 1.09-1.16 ms | 1.14-1.27 ms |
-| Stress, 8 GiB, worst frame | 1.66 ms (p50 311 us) | 1.22 ms (p50 214 us) |
+| Stress, 2 GiB, worst frame | 1.14-1.40 ms | 1.14-1.27 ms |
+| Stress, 8 GiB, worst frame | 1.43 ms (p50 304 us) | 1.22 ms (p50 214 us) |
 | Bullet hell, 2 GiB, p99.9 / worst | 3.3 / 3.35 ms | 4.0 / 4.3 ms |
-| City, 500k citizens, worst frame | 8.3 ms, none over 16 ms | 9.8 ms |
+| City, 500k citizens, worst frame | 7.6 ms (p50 3.84 ms), none over 16 ms | 9.8 ms |
 
-So the barrier gives DMD what the kernel tracker gives on Linux 6.7+, without needing that kernel, and it is the
-route to the other systems where DMD runs. The price is the median at large heaps (8 GiB: 311 against 214 us).
+(The table is from the expanded barrier; with the call, the 8 GiB stress was 1.66 ms and the city 8.3 ms.) So the
+barrier gives DMD what the kernel tracker gives on Linux 6.7+, without needing that kernel, and it is the route to the
+other systems where DMD runs. The price is the median at large heaps (8 GiB: 304 against 214 us).
 
 **The 500k city used to stall for 2 s** with this build. The cause was in the collector, not the barrier: it handed
 the scanner whole 4 KiB pages for each dirty card, and this program writes one pointer into a very large number of

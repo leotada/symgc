@@ -16,7 +16,7 @@ see `testing.md`.
 | LDC with a 2.112+ frontend, stock | ≥ 2.112 | Supported by upstream | Builds | Kernel tracker expected, as above | — | Expected; please report |
 | DMD 2.113 from this project (patched druntime) | 2.113 | Works | Works | Kernel tracker, Linux 6.7+ | — | Checked |
 | LDC 1.43-git from this project (`gc-card-marking`) | 2.113 | Does not run on this runtime | Works | Cards, or the kernel tracker | Yes | Checked |
-| DMD 2.113 from this project, `-preview=gcbarrier` | 2.113 | Does not run on this runtime | Works | Cards, on Linux x86-64 (the only target DMD builds for) | Yes, a call per pointer store | Checked |
+| DMD 2.113 from this project, `-preview=gcbarrier` | 2.113 | Does not run on this runtime | Works | Cards, on Linux x86-64 (the only target DMD builds for) | Yes, expanded in place for a pointer store | Checked |
 
 **Why GDC 15 fails:** its druntime (2.111) has `tlsGCData` but not the GC's thread-init hook, which druntime gained
 in April 2025 (2.112). The collector never learns about the threads druntime starts and asserts when it tries to

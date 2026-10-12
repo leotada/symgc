@@ -10,7 +10,7 @@ collector actually running. Read `platforms.md` first if you are not on Linux x8
 | **Plugin** | Stock DMD 2.112+, or LDC with a 2.112+ frontend | Nothing; oneday is a dub dependency | The allocator without a global lock, the concurrent paced sweep, and on Linux 6.7+ the concurrent mark through the kernel tracker. Elsewhere the mark is a pause |
 | **Plugin + this project's druntime** | DMD 2.113 built from this project | A dmd and Phobos build | The same, plus the game-engine calls (`GC.frameStats`, `excludeCurrentThread`, `step`, `defrag`) |
 | **Card barrier** | LDC built from this project's `gc-card-marking` branch | An LDC build with its runtime | The concurrent mark on any Linux kernel without page faults, the lowest tail, and the game-engine calls |
-| **Card barrier, DMD** | DMD built from this project, with `-preview=gcbarrier` | A dmd, plus druntime and Phobos rebuilt with the flag | The same concurrent mark through cards instead of the kernel tracker: it does not need Linux 6.7+. The barrier is a call, so a pointer store costs about 1 ns more than with LDC |
+| **Card barrier, DMD** | DMD built from this project, with `-preview=gcbarrier` | A dmd, plus druntime and Phobos rebuilt with the flag | The same concurrent mark through cards instead of the kernel tracker: it does not need Linux 6.7+. A pointer store costs about 0.7 to 1 ns more, as with LDC |
 
 GDC: GDC 15 (druntime 2.111) cannot run symgc in a program with more than one thread yet; see `platforms.md`.
 
@@ -130,10 +130,12 @@ collector read the card table instead of asking the kernel. The LDC changes are 
 
 ### This project's DMD with the card barrier (`-preview=gcbarrier`)
 
-The flag makes DMD's backend call `_d_gcBarrier(addr)` after each store of a pointer into memory that is not a local
-variable or a global, and `_d_gcBarrierRange(addr, n)` after a copy or a store of a slice, delegate or struct. The
-functions are in druntime (`core.internal.gc.cardbarrier`) and do nothing until a collector that wants the barrier
-starts: with the default GC the cost is a compare. oneday sets up the card table when it starts.
+The flag makes DMD's backend mark a card after each store of a pointer into memory that is not a local variable or a
+global: in place (`if ((addr - __sd_gc_card_lo) >> 9 < __sd_gc_card_n) __sd_gc_card_base[...] = 1`), and by calling
+`_d_gcBarrierRange(addr, n)` after a copy or a store of a slice, delegate or struct. The three variables and the range
+function are in druntime (`core.internal.gc.cardbarrier`), and the variables are zero until a collector that wants the
+barrier starts, so with the default GC the cost is a compare. oneday sets up the card table when it starts. The
+barrier assumes x86 store ordering (a plain byte store); an AArch64 DMD backend would have to use the call.
 
 **Every piece of D code that stores pointers into the GC heap must carry the flag**, as with LDC: a store made by code
 built without it is invisible to the concurrent mark and can lose an object. That means druntime and Phobos too.
