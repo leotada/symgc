@@ -212,6 +212,33 @@ struct Collector {
 		}
 	}
 
+	/**
+	 * Defragment heap and purge unused physical memory back to the OS:
+	 * 1. Flushes current thread's local cache.
+	 * 2. Waits for any running background sweep to finish.
+	 * 3. Defragments all small bins across all arenas (reclaiming empty slabs).
+	 * 4. Purges all free pages to the OS across all arenas.
+	 * Returns total pages purged to the OS.
+	 */
+	size_t defrag() {
+		threadCache.flush();
+
+		import d.gc.extent : gSweepCycle;
+		while (gSweepCycle.load() != 0) {
+			assistSweep();
+		}
+
+		size_t purgedPages = 0;
+		foreach (i; 0 .. ArenaCount) {
+			auto a = Arena.getIfInitialized(i);
+			if (a !is null) {
+				purgedPages += a.defrag(emap);
+			}
+		}
+
+		return purgedPages;
+	}
+
 	void runGCCycle() {
 		/**
 		 * An explicit collection is synchronous: let a running background

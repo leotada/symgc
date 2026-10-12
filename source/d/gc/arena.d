@@ -275,6 +275,20 @@ package:
 		return filler.assistSweep(emap);
 	}
 
+	/**
+	 * Defragment all small bins by returning completely empty slabs to the filler,
+	 * then immediately minimize all blocks by purging free pages back to the OS.
+	 * Returns total number of pages purged back to the OS.
+	 */
+	size_t defrag(ref CachedExtentMap emap) shared {
+		size_t freedSlabs = 0;
+		foreach (i; 0 .. BinCount) {
+			freedSlabs += bins[i].defrag(emap, &filler);
+		}
+
+		return filler.minimizeAll();
+	}
+
 	void clearBinsForCollection() shared {
 		foreach (i; 0 .. BinCount) {
 			bins[i].clearForCollection();

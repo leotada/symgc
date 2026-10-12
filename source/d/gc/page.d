@@ -2256,6 +2256,30 @@ private:
 		emap.clear(e);
 		freePagesImpl(e);
 	}
+
+	/**
+	 * Immediately minimize all blocks (dense and sparse) by returning all
+	 * free dirty pages to the OS via pages_purge, ignoring sweepRetain.
+	 * Returns total number of pages purged to the OS.
+	 */
+	package size_t minimizeAll() shared {
+		auto self = cast(PageFiller*) &this;
+		mutex.lock();
+		scope(exit) mutex.unlock();
+		version(Symgc_lock_hist) lastHolder = 6;
+
+		size_t purgedPages = 0;
+		foreach (ring; [&self.denseBlocks, &self.sparseBlocks]) {
+			for (auto r = ring.range; !r.empty; r.popFront()) {
+				auto b = r.front;
+				if (b !is null) {
+					purgedPages += b.minimize();
+				}
+			}
+		}
+
+		return purgedPages;
+	}
 }
 
 @"allocPages" unittest {

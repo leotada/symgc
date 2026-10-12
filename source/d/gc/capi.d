@@ -155,3 +155,9 @@ void __sd_gc_step(ulong maxTimeHns) {
 	auto collector = Collector(&threadCache);
 	collector.assistSweepTimed(maxTimeHns);
 }
+
+size_t __sd_gc_defrag() {
+	import d.gc.collector;
+	auto collector = Collector(&threadCache);
+	return collector.defrag();
+}

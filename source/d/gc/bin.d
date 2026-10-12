@@ -285,4 +285,53 @@ package:
 
 		(cast(PriorityExtentHeap*) &slabs).combine(cSlabs);
 	}
+
+	/**
+	 * Defragment the bin: inspect all cached slabs in `slabs` heap.
+	 * Slabs that have become completely free (nfree == nslots) are
+	 * removed from the bin and returned to the page filler via `batchFreeExtents`,
+	 * reclaiming the block pages so they can be purged to the OS.
+	 * Returns the number of freed extents.
+	 */
+	size_t defrag(ref CachedExtentMap emap, shared(PageFiller)* filler) shared {
+		Extent*[64] retainBuf = void;
+		size_t retainCount = 0;
+		Extent*[64] freedBuf = void;
+		size_t freedCount = 0;
+
+		{
+			mutex.lock();
+			scope(exit) mutex.unlock();
+
+			auto self = cast(Bin*) &this;
+			auto heap = cast(PriorityExtentHeap*) &slabs;
+			if (heap.empty) {
+				return 0;
+			}
+
+			while (!heap.empty) {
+				auto e = heap.pop();
+				if (e.nfree == e.nslots && freedCount < freedBuf.length) {
+					freedBuf[freedCount++] = e;
+				} else {
+					if (retainCount < retainBuf.length) {
+						retainBuf[retainCount++] = e;
+					} else {
+						heap.insert(e);
+						break;
+					}
+				}
+			}
+
+			foreach (i; 0 .. retainCount) {
+				heap.insert(retainBuf[i]);
+			}
+		}
+
+		if (freedCount > 0) {
+			filler.batchFreeExtents(emap, freedBuf[0 .. freedCount]);
+		}
+
+		return freedCount;
+	}
 }

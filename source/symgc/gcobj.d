@@ -34,6 +34,7 @@ extern(C) nothrow {
 	void __sd_gc_step(ulong maxTimeHns);
 	void __sd_gc_time_thread(ulong* dst);
 	void __sd_gc_time_total(ulong* dst);
+	size_t __sd_gc_defrag();
 
 	// hook prototypes needed for druntime api (see below)
 	void* __sd_gc_hook_alloc(size_t size, bool containsPointers, bool zeroData);
@@ -171,7 +172,7 @@ final class SnazzyGC : GC, GCTelemetry
 	 */
 	void minimize() nothrow
 	{
-		// Minimization happens on every collect.
+		__sd_gc_defrag();
 	}
 
 	/**
@@ -418,6 +419,11 @@ final class SnazzyGC : GC, GCTelemetry
 	void step(ulong maxTimeHns) @trusted nothrow @nogc
 	{
 		(cast(void function(ulong) nothrow @nogc)&__sd_gc_step)(maxTimeHns);
+	}
+
+	size_t defrag() @trusted nothrow @nogc
+	{
+		return (cast(size_t function() nothrow @nogc)&__sd_gc_defrag)();
 	}
 
 	/**
