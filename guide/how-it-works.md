@@ -69,8 +69,19 @@ mark threads (2-6)            [ mark ................... ]
    may therefore read another dead object, which many programs do even though the spec forbids it.
 7. **Sweep, paced.** The GC thread returns dead slots to their slabs and slabs to their bins, one block at a time,
    holding a lock for about 10 µs per step. It runs at most half of the time (`SYMGC_SWEEP_DUTY`). A thread that
-   allocates while the heap is past 1.25x the target helps with the sweep, so the heap cannot run away. Free pages
+   allocates while the heap is past the hard limit helps with the sweep, so the heap cannot run away. Free pages
    are kept warm up to the target and returned to the OS in small chunks.
+
+**The hard limit during the mark.** A thread that allocates past the hard limit while the mark runs cannot help it
+(the mark is not work an allocator can take); it waits until the mark ends. The limit is the target plus an
+allowance, and a fixed quarter of the target is too little when the mark is long: a heap of a gigabyte, with 10 million
+objects, grows by about 70,000 pages (280 MB) during a mark of one to two seconds, and the program stalled for the
+rest of it. The allowance now follows the growth seen during the last marks: 1.5 times the largest of them, with a
+slow decay, between a quarter and a half of the target. When a thread had to wait, the heap stopped growing at
+that moment, so the growth is scaled up to the whole length of the mark (at most eight times). The first mark after a
+burst of allocation, such as loading a level, has no history and still pays the old limit. A program that would need
+more than half the target is allocating faster than the mark can follow, and more room only makes its heap bigger, so
+it keeps the quarter (`SYMGC_ADAPTIVE_LIMIT=0` turns the whole mechanism off).
 
 The mark is the algorithm of Boehm, Demers and Shenker ("Mostly parallel garbage collection", PLDI 1991): mark while
 the program runs, then fix up what it changed. Pauses depend mostly on the number of threads and on how much was

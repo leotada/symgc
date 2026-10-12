@@ -186,6 +186,7 @@ Environment variables, read at start-up:
 | `SYMGC_MARK_NICE=n` | 10 | Nice value of the mark threads (Linux) |
 | `SYMGC_SWEEP_DUTY=n` | 50 | Percent of the time the background sweeper may run |
 | `SYMGC_SWEEP_NICE=n` | 10 | Nice value of the sweeper (Linux) |
+| `SYMGC_ADAPTIVE_LIMIT=0` | on | Use a fixed hard limit (the target plus a quarter) during the mark, instead of one that follows how much the heap grew in the last marks (`how-it-works.md`) |
 | `SYMGC_CARD_SUMMARY=1` | off | With cards: also keep a summary byte per 64 KiB (faster remark at 8 GiB, slower stores with many threads) |
 | `SYMGC_HEAP_RESERVE_GIB=n` | 256 (16 on Android and iOS) | With cards: address space to reserve at start-up for the memory that holds pointers, the most that part of the heap can grow to. The collector halves the request, down to 2 GiB, if the system will not give it |
 

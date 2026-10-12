@@ -92,6 +92,26 @@ struct DirtyList {
 	}
 }
 
+version(Symgc_phase_trace) {
+	// When the concurrent mark started, for the trace lines.
+	__gshared ulong gTraceMarkStart;
+}
+
+/**
+ * How far the heap may grow past the collection target while the mark runs.
+ *
+ * A thread that allocates past the hard limit during a mark waits for it
+ * (`assistSweep`): it cannot help. A fixed quarter of the target is not enough
+ * when the mark is long, as for a heap of a gigabyte or more: the program stalls
+ * for as long as the mark has left. The allowance follows what the heap grew by
+ * during the last marks, as pages. When a thread had to wait, the growth is
+ * cut short by the wait itself, so it is extrapolated to the length of the mark.
+ */
+import d.sync.atomic : Atomic;
+shared Atomic!ulong gMarkBlockedAt;     // when a thread first waited for the mark, 0 if none did
+__gshared size_t gMarkStartUsed;        // pages in use when the mark started
+__gshared size_t gMarkGrowthDemand;     // pages the heap wants to grow by during a mark
+
 struct Collector {
 	ThreadCache* treadCache;
 
@@ -134,9 +154,13 @@ struct Collector {
 		 */
 		if (gMarkActive.load() != 0) {
 			import d.gc.time : sleepMicros;
+			ulong none = 0;
+			gMarkBlockedAt.cas(none, getMonotonicTime());
+
 			version(Symgc_phase_trace) {
 				import core.stdc.stdio : fprintf, stderr;
-				fprintf(stderr, "gcwait: mark active, used=%zu pages over hardLimit=%zu pages\n",
+				fprintf(stderr, "gcwait: %.0f us into the mark, used=%zu pages over hardLimit=%zu pages\n",
+				        cast(double) (getMonotonicTime() - gTraceMarkStart) / Microsecond,
 				        cast(size_t) Arena.computeUsedPageCount(), cast(size_t) gSweepHardLimit);
 			}
 
@@ -564,6 +588,10 @@ private:
 
 		// 3. The mark, with the program running.
 		auto tMark0 = getMonotonicTime();
+		version(Symgc_phase_trace) {
+			gTraceMarkStart = tMark0;
+		}
+
 		markEndGC();
 
 		DirtyList list;
@@ -586,8 +614,8 @@ private:
 				import core.stdc.stdio : fprintf, stderr;
 				version(Symgc_cards) {
 					import d.gc.cards : gCardsFound;
-					fprintf(stderr, "gcround %u dirty_pages=%zu cards=%zu at %.0f us\n", rounds, lastPages,
-					        gCardsFound, cast(double) (getMonotonicTime() - tMark0) / Microsecond);
+					fprintf(stderr, "gcround %u dirty_pages=%zu cards=%zu used=%zu at %.0f us\n", rounds, lastPages,
+					        gCardsFound, cast(size_t) Arena.computeUsedPageCount(), cast(double) (getMonotonicTime() - tMark0) / Microsecond);
 					gCardsFound = 0;
 				} else {
 					fprintf(stderr, "gcround %u dirty_pages=%zu at %.0f us\n", rounds, lastPages,
@@ -702,6 +730,7 @@ private:
 		}
 
 		gMarkActive.store(0);
+		updateMarkGrowthDemand(tMark0);
 
 		version(Symgc_druntime_hooks) {
 			import core.thread.symthread;
@@ -829,9 +858,60 @@ private:
 			fprintf(stderr, "gcstart used=%zu pages nextTarget=%zu pages\n", usedPages, cast(size_t) target);
 		}
 
+		// A quarter of the target, or 1.5 times what the heap grew by during
+		// the last marks if that is more, up to half the target. A program
+		// that would need more than that is allocating faster than the mark
+		// can follow: extra room only lets the heap grow (measured: twice
+		// the memory and as many stalls), so it keeps the quarter.
+		__gshared int adaptive = -1;
+		if (adaptive < 0) {
+			import core.stdc.stdlib : getenv;
+			auto env = getenv("SYMGC_ADAPTIVE_LIMIT");
+			adaptive = env !is null && env[0] == '0' ? 0 : 1;
+		}
+
+		auto allowance = target / 4;
+		auto wanted = adaptive ? gMarkGrowthDemand + gMarkGrowthDemand / 2 : 0;
+		if (wanted > allowance && wanted <= target / 2) {
+			allowance = wanted;
+		}
+
 		gSweepGrowthLimit = target + target / 8;
-		gSweepHardLimit = target + target / 4;
+		gSweepHardLimit = target + allowance;
 		gSweepRetainPages = target;
+
+		gMarkStartUsed = usedPages;
+		gMarkBlockedAt.store(0);
+	}
+
+	/**
+	 * The mark is over: remember how much the heap grew by while it ran
+	 * (see `gMarkGrowthDemand`). If a thread waited at the hard limit, the heap
+	 * stopped growing then, so the growth is scaled up to the whole mark.
+	 */
+	void updateMarkGrowthDemand(ulong markStart) {
+		auto now = getMonotonicTime();
+		auto used = Arena.computeUsedPageCount();
+		size_t growth = used > gMarkStartUsed ? used - gMarkStartUsed : 0;
+
+		auto blockedAt = gMarkBlockedAt.load();
+		if (blockedAt > markStart) {
+			// Up to eight times: a wait right at the start says little.
+			auto before = max((blockedAt - markStart), (now - markStart) / 8);
+			growth = cast(size_t) (cast(double) growth * (now - markStart) / before);
+		}
+
+		// Remember the larger of this mark and the last ones, forgetting slowly.
+		auto remembered = gMarkGrowthDemand - gMarkGrowthDemand / 4;
+		gMarkGrowthDemand = max(growth, remembered);
+
+		version(Symgc_phase_trace) {
+			import core.stdc.stdio : fprintf, stderr;
+			fprintf(stderr, "gcgrowth: heap grew %zu pages in %.0f us of mark%s, demand now %zu pages\n",
+			        cast(size_t) (used > gMarkStartUsed ? used - gMarkStartUsed : 0),
+			        cast(double) (now - markStart) / Microsecond,
+			        (blockedAt > markStart ? " (a thread waited)" : "").ptr, gMarkGrowthDemand);
+		}
 	}
 
 	/**

@@ -329,6 +329,13 @@ struct ScanningList {
 			size = getAllocSize(count * WorkItem.sizeof);
 		}
 
+		version(Symgc_phase_trace) {
+			if (size >= (32 << 20)) {
+				import core.stdc.stdio : fprintf, stderr;
+				fprintf(stderr, "gcworklist grows to %zu MiB (%zu items)\n", size >> 20, size / WorkItem.sizeof);
+			}
+		}
+
 		auto ptr = threadCache.realloc(worklist.ptr, size, false);
 		worklist = (cast(WorkItem*) ptr)[0 .. size / WorkItem.sizeof];
 	}

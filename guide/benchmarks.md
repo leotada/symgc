@@ -185,6 +185,40 @@ the meantime; rounds of 80k, 150k, 250k, 450k pages never converged. The collect
 bytes), and rounds shrink (7-10k pages, then about 1k). LDC with cards went from 6.9 to 6.1 ms worst at the same
 time. Not re-run after this change: the 8 GiB stress and the bullet hell in the table above.
 
+## Large heaps with many pointers: the hard limit follows the mark
+
+`entity_init.d`: a scene of entities with 8 pointer fields each, 1 GiB (10.3 million entities, 80 million pointers),
+a window of it rewritten every frame, new entities allocated every frame, paced at 60 frames per second. Marking
+such a heap takes one to two seconds (about 1.2 GB/s scanned), and the heap grows by about 70,000 pages (280 MB)
+meanwhile. With the old fixed limit (the target plus a quarter) a thread that allocated past it waited for the
+mark to end:
+
+The same binary with and without the new limit (`SYMGC_ADAPTIVE_LIMIT=0` is the old one), 60 s runs:
+
+| Run | Limit | Frames over 16 ms | Worst frame | Frames over 5 ms | Peak RSS |
+|---|---|---|---|---|---|
+| 1 GiB, 11 MB/s allocation (2,000 entities a frame) | fixed | 1 (first mark, 0.64 s) | 0.64 s | 33 | 1.82 GB |
+| | follows the mark | 1 (the same) | 0.62 s | 3 | 1.79 GB |
+| 1 GiB, 115 MB/s (20,000 entities a frame) | fixed | 10 and 8 (two runs) | 1.55 s, 1.95 s | all (frames take 6 ms) | 6.9-7.1 GB |
+| | follows the mark | 5 and 6 | 0.88 s, 1.04 s | all | 7.5-7.6 GB |
+| 512 MiB unpaced, 40 s (overload, see below) | fixed | 7 | 1.04 s | 36 | 1.76 GB |
+| | follows the mark | 7 and 6 | 1.17 s, 1.18 s | 56, 32 | 1.69-1.74 GB |
+
+At the lower rate the gain is in the tail below the stalls (frames over 5 ms: 33 to 3); at the higher one the stalls
+are fewer and shorter but not gone, and the memory is 5 to 10% larger. The first mark after a burst of allocation,
+such as building the scene, has no history to follow and still waits. The existing models are unchanged within noise
+(DMD with the barrier, one run each, fixed limit against follows the mark, from before the final rule below): stress 2 GiB worst
+1.27 / 1.47 ms, stress 8 GiB 1.85 / 1.91 ms, city 500k 9.7 / 8.8 ms, RTS 7.0 / 4.5 ms, open world 2.1 / 1.7 ms;
+peak RSS equal (RTS 2.5 / 1.8 GB).
+
+**Overload.** Run unpaced (`FPS=0`), the program rewrites the whole scene every 1.6 s, the dirty rounds do not
+converge and the mark takes 9 to 15 s: no collector keeps up with it. There, giving the allocator more room only made
+the heap bigger: 3.9-4.0 GB of RSS against 1.76 GB, with as many stalls. So the allowance is granted only up to half
+the target; when the growth the last marks needed is more than that, the program keeps the quarter. This rule was
+added after that measurement and was checked on this run (memory back to 1.7 GB) and on the 115 MB/s run above,
+but not on the other models. Where the heap's growth during a mark comes from (about 50,000 pages a second at 1 GiB,
+regardless of the program's own allocation, which is about 6,000 pages in the same time) is not explained yet.
+
 ## Reproducing
 
 ```sh
