@@ -64,11 +64,23 @@ enum CardsPerSummary = size_t(1) << (SummaryShift - CardShift);
 
 /**
  * What the code the compiler emits loads on each barrier.
+ *
+ * With `-version=Symgc_druntime_cards` the barrier is the compiler's own
+ * (`-preview=gcbarrier`, `core.internal.gc.cardbarrier` in druntime), and the
+ * variables are druntime's: defining them here too would be a duplicate symbol.
+ * druntime's barrier does not mark the summary, so the summary is off.
  */
-extern(C) __gshared size_t __sd_gc_card_lo;
-extern(C) __gshared size_t __sd_gc_card_n;
-extern(C) __gshared ubyte* __sd_gc_card_base;
-extern(C) __gshared ubyte* __sd_gc_card_summary_base;
+version(Symgc_druntime_cards) {
+	extern(C) extern __gshared size_t __sd_gc_card_lo;
+	extern(C) extern __gshared size_t __sd_gc_card_n;
+	extern(C) extern __gshared ubyte* __sd_gc_card_base;
+	extern(C) extern __gshared ubyte* __sd_gc_card_summary_base;
+} else {
+	extern(C) __gshared size_t __sd_gc_card_lo;
+	extern(C) __gshared size_t __sd_gc_card_n;
+	extern(C) __gshared ubyte* __sd_gc_card_base;
+	extern(C) __gshared ubyte* __sd_gc_card_summary_base;
+}
 
 // The window is carved in blocks of this many bytes (see d.gc.region).
 enum WindowGranule = size_t(1) << 30;
@@ -209,6 +221,10 @@ private __gshared bool gSummaryEnabled = false;
 private __gshared bool gSummaryChecked = false;
 
 private bool isSummaryEnabled() {
+	version(Symgc_druntime_cards) {
+		return false;
+	}
+
 	if (!gSummaryChecked) {
 		import core.stdc.stdlib : getenv;
 		auto env = getenv("SYMGC_CARD_SUMMARY");

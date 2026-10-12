@@ -576,6 +576,12 @@ private:
 
 			rounds++;
 
+			version(Symgc_phase_trace) {
+				import core.stdc.stdio : fprintf, stderr;
+				fprintf(stderr, "gcround %u dirty_pages=%zu at %.0f us\n", rounds, lastPages,
+				        cast(double) (getMonotonicTime() - tMark0) / Microsecond);
+			}
+
 			// Tracking failed: the remark will mark again from scratch.
 			if (!dirtyAvailable()) {
 				break;
