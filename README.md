@@ -1,5 +1,9 @@
 # SDC Garbage collector, ported to normal D
 
+> **This is the oneday fork** (branch `latency-p3`): symgc with a concurrent mark, a concurrent paced sweep and
+> game-engine controls, aimed at programs that must not pause, such as games. Start with [`guide/README.md`](guide/README.md).
+> The upstream text below still describes the base collector.
+
 This is a port of the [SDC](https://github.com/snazzy-d/sdc) garbage collector to D code that builds with DMD/LDC/gdc.
 
 The idea is to extract the GC portions of the SDC runtime (and everything needed) in order to be able to build using standard compilers.
