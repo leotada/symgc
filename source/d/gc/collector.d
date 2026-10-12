@@ -95,6 +95,8 @@ struct DirtyList {
 version(Symgc_phase_trace) {
 	// When the concurrent mark started, for the trace lines.
 	__gshared ulong gTraceMarkStart;
+	// Pages added, freed and added as slabs when the mark started.
+	__gshared ulong gTraceAdded0, gTraceFreed0, gTraceSlab0, gTraceGrown0;
 }
 
 /**
@@ -882,6 +884,13 @@ private:
 
 		gMarkStartUsed = usedPages;
 		gMarkBlockedAt.store(0);
+		version(Symgc_phase_trace) {
+			import d.gc.page : gTracePagesAdded, gTracePagesFreed, gTraceSlabPages, gTracePagesGrown;
+			gTraceGrown0 = gTracePagesGrown.load();
+			gTraceAdded0 = gTracePagesAdded.load();
+			gTraceFreed0 = gTracePagesFreed.load();
+			gTraceSlab0 = gTraceSlabPages.load();
+		}
 	}
 
 	/**
@@ -911,6 +920,13 @@ private:
 			        cast(size_t) (used > gMarkStartUsed ? used - gMarkStartUsed : 0),
 			        cast(double) (now - markStart) / Microsecond,
 			        (blockedAt > markStart ? " (a thread waited)" : "").ptr, gMarkGrowthDemand);
+
+			import d.gc.page : gTracePagesAdded, gTracePagesFreed, gTraceSlabPages, gTracePagesGrown;
+			fprintf(stderr, "gcgrowth:   extents added %zu pages (%zu as slabs), grown %zu, freed %zu pages\n",
+			        cast(size_t) (gTracePagesAdded.load() - gTraceAdded0),
+			        cast(size_t) (gTraceSlabPages.load() - gTraceSlab0),
+			        cast(size_t) (gTracePagesGrown.load() - gTraceGrown0),
+			        cast(size_t) (gTracePagesFreed.load() - gTraceFreed0));
 		}
 	}
 

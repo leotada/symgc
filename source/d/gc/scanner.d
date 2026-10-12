@@ -336,7 +336,40 @@ struct ScanningList {
 			}
 		}
 
-		auto ptr = threadCache.realloc(worklist.ptr, size, false);
+		version(Posix) {
+			/**
+			 * The list does not live in the heap: the collector frees
+			 * nothing in the heap while a concurrent mark runs, so every
+			 * step of the growth (a quarter more each time) stayed until
+			 * the next collection, six times the final size (200 MiB for a
+			 * list of 32 MiB), and the heap seemed to grow by that much.
+			 * A mapping goes back at once, and doubling keeps the copies
+			 * few.
+			 */
+			import d.gc.memmap;
+			import core.stdc.string : memcpy;
+			size = alignUp(max(size, 2 * worklist.length * WorkItem.sizeof),
+			               PageSize);
+
+			auto ptr = pages_map(null, size, PageSize);
+			if (unlikely(ptr is null)) {
+				import core.stdc.stdio : fprintf, stderr;
+				import core.stdc.stdlib : abort;
+				fprintf(stderr, "symgc: cannot map %zu bytes for the mark list\n", size);
+				abort();
+			}
+
+			if (cursor > 0) {
+				memcpy(ptr, worklist.ptr, cursor * WorkItem.sizeof);
+			}
+
+			if (worklist.ptr !is null) {
+				pages_unmap(worklist.ptr, worklist.length * WorkItem.sizeof);
+			}
+		} else {
+			auto ptr = threadCache.realloc(worklist.ptr, size, false);
+		}
+
 		worklist = (cast(WorkItem*) ptr)[0 .. size / WorkItem.sizeof];
 	}
 
@@ -357,7 +390,15 @@ struct ScanningList {
 		assert(activeThreads == 0, "Still running threads!");
 
 		// We now done, we can free the worklist.
-		(cast(ThreadCache*)threadCache).free(cast(void*) worklist.ptr);
+		version(Posix) {
+			if (worklist.ptr !is null) {
+				import d.gc.memmap;
+				pages_unmap(cast(void*) worklist.ptr,
+				            worklist.length * WorkItem.sizeof);
+			}
+		} else {
+			(cast(ThreadCache*)threadCache).free(cast(void*) worklist.ptr);
+		}
 
 		worklist = null;
 		threadCache = null;

@@ -15,6 +15,12 @@ import symgc.intrinsics;
 import d.gc.time;
 __gshared ulong[8] gSweepT;
 
+version(Symgc_phase_trace) {
+	// Pages given out and taken back since the start, for the trace
+	// (extents: allocated, freed; and how many of the allocated were slabs).
+	shared Atomic!ulong gTracePagesAdded, gTracePagesFreed, gTraceSlabPages, gTracePagesGrown;
+}
+
 /**
  * What a thread that helps with the sweep found: nothing to do (no sweep, or
  * it is over), it did a step, or the work is there but it is not for it now.
@@ -682,6 +688,12 @@ private:
 		version(Symgc_lock_hist) segHist(4, getMonotonicTime() - t2);
 
 		usedPageCount.fetchAdd(pages);
+		version(Symgc_phase_trace) {
+			gTracePagesAdded.fetchAdd(pages);
+			if (ec.isSlab()) {
+				gTraceSlabPages.fetchAdd(pages);
+			}
+		}
 
 		auto ptr = block.address + n * PageSize;
 		e.at(ptr, pages, block, ec);
@@ -715,6 +727,13 @@ private:
 
 		auto npages = pages + extraBlocks * PagesInBlock;
 		usedPageCount.fetchAdd(npages);
+		version(Symgc_phase_trace) {
+			gTracePagesGrown.fetchAdd(npages);
+			if (npages >= 256) {
+				import core.stdc.stdio : fprintf, stderr;
+				fprintf(stderr, "gchuge: alloc %u pages\n", npages);
+			}
+		}
 
 		auto leadSize = extraBlocks * BlockSize;
 		auto ptr = block.address - leadSize;
@@ -774,6 +793,7 @@ private:
 		}
 
 		usedPageCount.fetchSub(e.npages);
+		version(Symgc_phase_trace) gTracePagesFreed.fetchAdd(e.npages);
 		unusedExtents.insert(e);
 	}
 
@@ -801,6 +821,7 @@ private:
 		}
 
 		usedPageCount.fetchAdd(delta);
+		version(Symgc_phase_trace) gTracePagesGrown.fetchAdd(delta);
 		e.growBy(delta);
 
 		return true;
@@ -854,6 +875,13 @@ private:
 		assert(!dirty, "Huge allocations shouldn't be dirty!");
 
 		usedPageCount.fetchAdd(delta);
+		version(Symgc_phase_trace) {
+			gTracePagesGrown.fetchAdd(delta);
+			if (delta >= 256) {
+				import core.stdc.stdio : fprintf, stderr;
+				fprintf(stderr, "gchuge: grow by %u pages to %u\n", delta, e.npages + delta);
+			}
+		}
 		e.growBy(delta);
 
 		// Need to commit all pages that were previously uncommitted, but are
