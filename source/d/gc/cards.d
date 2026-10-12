@@ -294,10 +294,15 @@ extern(C) void __sd_gc_card_range(void* dst, size_t size) {
 	}
 }
 
+version(Symgc_phase_trace) {
+	// Dirty cards found by collectCards, for the phase trace (collector thread only).
+	__gshared size_t gCardsFound;
+}
+
 /**
  * Read and clear the cards of [start, start + size), which lies in the window,
- * calling `dg` with the page aligned runs that cover the dirty ones. Returns
- * the number of pages.
+ * calling `dg` with the card aligned runs that cover the dirty ones. Returns
+ * the size of the runs in pages, rounded up.
  */
 size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*, size_t) dg) {
 	enum PageSize = 4096;
@@ -313,13 +318,13 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
 	auto hi = (start + size - windowLo) >> CardShift;
 	auto base = __sd_gc_card_base;
 
-	size_t pages = 0;
+	size_t bytes = 0;
 	size_t runLo = 0;
 	size_t runHi = 0;
 
 	void flush() {
 		if (runLo < runHi) {
-			pages += (runHi - runLo) / PageSize;
+			bytes += runHi - runLo;
 			if (dg !is null) {
 				dg(cast(const(void)*) runLo, runHi - runLo);
 			}
@@ -328,16 +333,25 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
 		runLo = runHi = 0;
 	}
 
-	void page(size_t pageIndex) {
-		auto s = windowLo + pageIndex * PageSize;
+	/**
+	 * One dirty card. The runs handed to `dg` are cards, not pages: a program
+	 * that writes one pointer in each of many pages (a hash table, a tree)
+	 * would otherwise make the collector rescan eight times what it wrote.
+	 */
+	void card(size_t cardIndex) {
+		version(Symgc_phase_trace) {
+			gCardsFound++;
+		}
+
+		auto s = windowLo + (cardIndex << CardShift);
 		if (s == runHi && runHi != 0) {
-			runHi = s + PageSize;
+			runHi = s + CardSize;
 			return;
 		}
 
 		flush();
 		runLo = s;
-		runHi = s + PageSize;
+		runHi = s + CardSize;
 	}
 
 	// If summary byte tracking is enabled, skip 64 KiB regions via the summary table
@@ -375,7 +389,7 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
 					auto v = atomicExchange!(MemoryOrder.acq_rel)(w, 0UL);
 					foreach (j; 0 .. 8) {
 						if ((v >> (8 * j)) & 0xff) {
-							page((i + j) / CardsPerPage);
+							card(i + j);
 						}
 					}
 
@@ -385,7 +399,7 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
 
 				auto b = cast(shared(ubyte)*) (base + i);
 				if (atomicExchange!(MemoryOrder.acq_rel)(b, ubyte(0))) {
-					page(i / CardsPerPage);
+					card(i);
 				}
 
 				i++;
@@ -397,7 +411,7 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
 		while (i < hi && (i & 7) != 0) {
 			auto b = cast(shared(ubyte)*) (base + i);
 			if (atomicExchange!(MemoryOrder.acq_rel)(b, ubyte(0))) {
-				page(i / CardsPerPage);
+				card(i);
 			}
 			i++;
 		}
@@ -422,7 +436,7 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
 					auto v = atomicExchange!(MemoryOrder.acq_rel)(w, 0UL);
 					foreach (j; 0 .. 8) {
 						if ((v >> (8 * j)) & 0xff) {
-							page((i + chunk * 8 + j) / CardsPerPage);
+							card(i + chunk * 8 + j);
 						}
 					}
 				}
@@ -436,7 +450,7 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
 				auto v = atomicExchange!(MemoryOrder.acq_rel)(w, 0UL);
 				foreach (j; 0 .. 8) {
 					if ((v >> (8 * j)) & 0xff) {
-						page((i + j) / CardsPerPage);
+						card(i + j);
 					}
 				}
 			}
@@ -446,14 +460,14 @@ size_t collectCards(size_t start, size_t size, scope void delegate(const(void)*,
 		while (i < hi) {
 			auto b = cast(shared(ubyte)*) (base + i);
 			if (atomicExchange!(MemoryOrder.acq_rel)(b, ubyte(0))) {
-				page(i / CardsPerPage);
+				card(i);
 			}
 			i++;
 		}
 	}
 
 	flush();
-	return pages;
+	return (bytes + PageSize - 1) / PageSize;
 }
 
 /**

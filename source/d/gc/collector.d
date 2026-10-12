@@ -578,8 +578,15 @@ private:
 
 			version(Symgc_phase_trace) {
 				import core.stdc.stdio : fprintf, stderr;
-				fprintf(stderr, "gcround %u dirty_pages=%zu at %.0f us\n", rounds, lastPages,
-				        cast(double) (getMonotonicTime() - tMark0) / Microsecond);
+				version(Symgc_cards) {
+					import d.gc.cards : gCardsFound;
+					fprintf(stderr, "gcround %u dirty_pages=%zu cards=%zu at %.0f us\n", rounds, lastPages,
+					        gCardsFound, cast(double) (getMonotonicTime() - tMark0) / Microsecond);
+					gCardsFound = 0;
+				} else {
+					fprintf(stderr, "gcround %u dirty_pages=%zu at %.0f us\n", rounds, lastPages,
+					        cast(double) (getMonotonicTime() - tMark0) / Microsecond);
+				}
 			}
 
 			// Tracking failed: the remark will mark again from scratch.
@@ -596,9 +603,23 @@ private:
 				break;
 			}
 
-			markRoundGC(gcCycle, space, (shared(Scanner)* s) {
-				list.seed(s);
-			});
+			version(Symgc_phase_trace) {
+				import core.stdc.stdio : fprintf, stderr;
+				ulong seedTime = 0;
+				auto tRound0 = getMonotonicTime();
+				markRoundGC(gcCycle, space, (shared(Scanner)* s) {
+					auto t0 = getMonotonicTime();
+					list.seed(s);
+					seedTime = getMonotonicTime() - t0;
+				});
+				fprintf(stderr, "gcround %u scan: seed %.0f us, total %.0f us\n", rounds,
+				        cast(double) seedTime / Microsecond,
+				        cast(double) (getMonotonicTime() - tRound0) / Microsecond);
+			} else {
+				markRoundGC(gcCycle, space, (shared(Scanner)* s) {
+					list.seed(s);
+				});
+			}
 		}
 
 		ctx.concurrentMark = getMonotonicTime() - tMark0;

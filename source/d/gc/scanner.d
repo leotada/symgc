@@ -570,14 +570,19 @@ public:
 			auto born = e.sweepTag == epoch;
 			auto ec = pd.extentClass;
 
+			// The part of this page that was asked for: all of it for a
+			// range of pages, a few cards for a range of cards.
+			auto pLo = max(p, cast(size_t) start);
+			auto pHi = min(p + PageSize, end);
+
 			if (ec.isLarge()) {
 				if (!born && !e.isMarkedLarge(cycle)) {
 					continue;
 				}
 
 				size_t eaddr = cast(size_t) e.address;
-				auto lo = max(p, eaddr);
-				auto hi = min(p + PageSize, eaddr + e.size);
+				auto lo = max(pLo, eaddr);
+				auto hi = min(pHi, eaddr + e.size);
 				if (lo < hi) {
 					emit(lo, hi);
 				}
@@ -590,8 +595,8 @@ public:
 			size_t slabBase = p - pd.index * PageSize;
 			size_t slotSize = bi.slotSize;
 
-			auto first = (p - slabBase) / slotSize;
-			auto last = min((p + PageSize - 1 - slabBase) / slotSize, bi.nslots - 1);
+			auto first = (pLo - slabBase) / slotSize;
+			auto last = min((pHi - 1 - slabBase) / slotSize, bi.nslots - 1);
 
 			ulong sparseMarks = 0;
 			const(ulong)* denseMarks = null;
@@ -618,8 +623,8 @@ public:
 				}
 
 				size_t slot = slabBase + index * slotSize;
-				auto lo = max(p, slot);
-				auto hi = min(p + PageSize, slot + slotSize);
+				auto lo = max(pLo, slot);
+				auto hi = min(pHi, slot + slotSize);
 				if (lo < hi) {
 					emit(lo, hi);
 				}
