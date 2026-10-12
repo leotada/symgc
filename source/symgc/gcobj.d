@@ -8,6 +8,18 @@ import core.thread.threadbase : ThreadBase;
 
 import core.stdc.string : memset;
 
+// The game-engine interface (GC.frameStats, thread exclusion, step, defrag)
+// only exists in a patched druntime. Without it the collector still builds
+// and runs; the methods are there but nothing in druntime calls them.
+enum hasGCTelemetry = is(GCTelemetry);
+
+static if (hasGCTelemetry)
+	private alias SnazzyBases = AliasSeq!(GC, GCTelemetry);
+else
+	private alias SnazzyBases = AliasSeq!(GC);
+
+private template AliasSeq(T...) { alias AliasSeq = T; }
+
 // when running unittests and druntime is involved, set the GC to the symmetry GC
 version(Symgc_testing) version(Symgc_druntime_hooks) {
 	extern(C) __gshared rt_options = ["gcopt=gc:sdc"];
@@ -144,7 +156,7 @@ private GC initialize()
 	return initializeQuiet();
 }
 
-final class SnazzyGC : GC, GCTelemetry
+final class SnazzyGC : SnazzyBases
 {
 	void enable()
 	{
@@ -363,6 +375,7 @@ final class SnazzyGC : GC, GCTelemetry
 	 * Retrieve real-time frame telemetry about garbage collection.
 	 * Designed for game loops, profilers, and HUDs.
 	 */
+	static if (hasGCTelemetry)
 	core.memory.GC.FrameStats frameStats() nothrow @nogc @safe
 	{
 		import core.time : nsecs;

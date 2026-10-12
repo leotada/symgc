@@ -197,7 +197,35 @@ void scanWorldPausedData(ScanDg scan) {
 		(cast(NoThrowScanDg)scan)(r);
 	}
 
+	// An unpatched druntime reads the caller's thread object in
+	// thread_scanAllType without checking it for null, and the collector's own
+	// thread is not a druntime thread. While it scans, it poses as a
+	// placeholder whose m_lock is set, which tells druntime to leave the
+	// caller's stack bookkeeping alone.
+	auto posing = self is null;
+	if (posing)
+		ThreadBase.setThis(scanPlaceholder());
+	scope(exit) if (posing)
+		ThreadBase.setThis(null);
+
 	thread_scanAllType(&scanItem);
+}
+
+private Thread scanPlaceholder() nothrow
+{
+	align(16) static __gshared ubyte[__traits(classInstanceSize, Thread)] store;
+	static __gshared bool ready;
+
+	auto t = cast(Thread) cast(void*) store.ptr;
+	if (!ready) {
+		// Only ever called with the world stopped, from the collector's thread.
+		auto init = cast(const(ubyte)[]) typeid(Thread).initializer;
+		store[0 .. init.length] = init[];
+		t.m_lock = true;
+		ready = true;
+	}
+
+	return t;
 }
 
 bool resumeDruntimeThreads(ref uint suspended) {
