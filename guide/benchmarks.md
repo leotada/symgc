@@ -273,6 +273,20 @@ user CPU above mutator frame sum, and the cycle-frame tail — not the quiet med
 `-version=Symgc_sync_sweep` makes --worst worse (more over-budget frames). `strace -c -e madvise`:
 ~60 calls / ~0.6 ms per --worst run — hypothesis 2 (purge) dropped.
 
+### 0058: Appender qalloc floor (mean acceptance)
+
+Phobos `Appender.ensureAddable` calls `GC.qalloc(nbytes, BlkAttr.NO_SCAN)` without `APPENDABLE`, so
+the 0056 floor inside `allocAppendable` never applied to `std.format`. 0058 floors plain small
+`NO_SCAN` `qalloc` to 64 bytes and uses a soft pd-cache in `extendLarge`.
+
+| Scenario (medians of 5, DMD 2.113, 16-core) | ratio vs same-session druntime |
+|---|---|
+| `--worst` mean | **1.14×** (was ~1.23–1.27× after 0056) |
+| `--openworld` mean | **1.12×** (was ~1.3×) |
+| `--worst-safe` mean / p99 | ~1.01× / ~1.01× (tie within noise); worst still higher |
+
+bullet_hell_stress concurrent: max ~2.5 ms, 0 over 16 ms, RSS ~2.9 GB. `correctness.sh` OK.
+
 ### Phase 2 falsification numbers
 
 | Experiment | Result |
