@@ -32,6 +32,7 @@ Phobos needs no fork: build the stock one against the project's druntime.
 | D | [This project's DMD](#d-this-projects-dmd-and-the-game-engine-calls) | DMD built from the fork | as A | a dmd + Phobos build | Checked |
 | E | [LDC with the card barrier](#e-ldc-with-the-card-barrier) | LDC built from the `gc-card-marking` branch | any Linux kernel, no page faults, lowest tail | an LDC build | Checked |
 | F | [DMD with `-preview=gcbarrier`](#f-dmd-with--previewgcbarrier) | DMD built from the fork | any Linux kernel | a dmd, druntime and Phobos built with the flag | Checked |
+| G | [GDC with the barrier plugin](#g-gdc-with-the-barrier-plugin) | GDC built with plugin support (GCC 15.3 tested) | any Linux kernel | a GCC build, the plugin, a libphobos built with it | Checked on Linux x86-64 |
 
 Without a concurrent mark (an old kernel and no barrier) everything still works, with the mark as a pause and the
 sweep still beside the program. Start with A or B; move to E or F when the kernel tracker's page faults or the kernel
@@ -160,6 +161,31 @@ dmd -conf= -I<druntime>/import -I<phobos> -fPIC -O -release -inline -preview=gcb
 
 The rules of E apply. The barrier is a plain byte store, valid on x86 only (`integration.md`, section 4, lists what it
 does not cover: inline assembly and C code).
+
+## G. GDC with the barrier plugin
+
+The same barrier as a GCC plugin (the `gdc-gcbarrier` repository, a sibling of `symgc` and `ldc`; not published yet),
+for a program built with GDC. A
+distribution's GCC usually has no plugin headers, so the reference setup is GCC 15.3.0 built from source with
+`--enable-languages=c,c++,d --enable-plugin`; the plugin README has the commands. Then build the plugin
+(`make -C gdc-gcbarrier`), rebuild GCC's libphobos with it, and link that one:
+
+```sh
+make -C <gcc-build>/x86_64-pc-linux-gnu/libphobos clean
+make -C <gcc-build>/x86_64-pc-linux-gnu/libphobos -j GDCFLAGS="-g -O2 -fplugin=<repo>/gdc-gcbarrier/gcbarrier.so"
+
+gdc -O2 -fplugin=<repo>/gdc-gcbarrier/gcbarrier.so \
+    -fversion=Symgc_cards -fversion=Symgc_druntime_hooks -fversion=SymGC \
+    -I$SYMGC/source mygame.d $(find $SYMGC/source -name '*.d') \
+    -static-libphobos -L<gcc-build>/x86_64-pc-linux-gnu/libphobos/src/.libs
+```
+
+(`bench/` and `plans/bench/core_bench/gdc_cards.sh` do the second command.) The plugin also defines
+`version (D_GCBarrier)`; `-fversion=D_GCBarrier` is refused by gdc, which reserves every `D_*` name. The rules of E apply:
+a store made by code built without the plugin can be missed. GCC 15 ships druntime 2.111, which has no thread-init hook;
+the collector then attaches each druntime thread itself, with one limit: a thread-local constructor of another module
+that allocates before `symgc.gcobj`'s runs on a thread the collector does not know yet, so keep such constructors free of
+GC allocation.
 
 ## Check that it is running
 
