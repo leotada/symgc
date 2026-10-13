@@ -95,6 +95,11 @@ enum druntimeCallsThreadHooks = __traits(compiles, {
 
 static if (!druntimeCallsThreadHooks) version (Posix)
 {
+	// The lock of druntime's thread list is taken and released through these two (their names say
+	// what the collector uses them for).
+	extern(C) private void thread_preStopTheWorld() nothrow @nogc;
+	extern(C) private void thread_postRestartTheWorld() nothrow @nogc;
+
 	// Set on the thread that created the process state (the one that ran initialize):
 	// it is registered already, and lives as long as the collector.
 	private bool processThread;
@@ -109,9 +114,18 @@ static if (!druntimeCallsThreadHooks) version (Posix)
 			return;
 
 		if (processThread)
+		{
 			t.tlsGCData = &threadCache;
-		else
-			initSDCThread(t);
+			return;
+		}
+
+		// The stop-the-world holds the list's lock (thread_preStopTheWorld) before it takes
+		// its own, so registering under that lock puts this thread either wholly before the
+		// stop (it is signalled like any other) or wholly after it (it never saw the world
+		// stopped half way through registering).
+		thread_preStopTheWorld();
+		scope(exit) thread_postRestartTheWorld();
+		initSDCThread(t);
 	}
 
 	static ~this()

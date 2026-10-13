@@ -5,6 +5,7 @@ import core.thread.osthread;
 import core.thread.threadbase;
 import core.thread.types;
 import d.gc.types;
+import symgc.gcobj : druntimeCallsThreadHooks;
 
 private {
 	import core.internal.traits : externDFunc;
@@ -77,7 +78,14 @@ bool suspendDruntimeThreads(bool alwaysSignal, ref uint suspended) {
 		auto tc = cast(ThreadCache*) t.tlsGCData();
 
 		if (tc is null) {
-			assert(0, "tlsGCData was not set for this thread!");
+			// A druntime without thread hooks (see symgc.gcobj): a thread that is on the list
+			// but has not run its thread-local constructors yet. It attaches under the list's
+			// lock, which the stop holds, so it cannot be half registered, and it has not
+			// touched the collector. It is left running. With the hooks this cannot happen.
+			static if (druntimeCallsThreadHooks)
+				assert(0, "tlsGCData was not set for this thread!");
+			else
+				continue;
 		}
 		version (Posix)
 		{
