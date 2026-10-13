@@ -282,10 +282,13 @@ the 0056 floor inside `allocAppendable` never applied to `std.format`. 0058 floo
 | Scenario (medians of 5, DMD 2.113, 16-core) | ratio vs same-session druntime |
 |---|---|
 | `--worst` mean | **1.14×** (was ~1.23–1.27× after 0056) |
-| `--openworld` mean | **1.12×** (was ~1.3×) |
+| `--openworld` mean | **1.12×** (was ~1.3×); after 0060 **1.11×** |
 | `--worst-safe` mean / p99 | ~1.01× / ~1.01× (tie within noise); worst still higher |
 
-bullet_hell_stress concurrent: max ~2.5 ms, 0 over 16 ms, RSS ~2.9 GB. `correctness.sh` OK.
+**0060:** small `allocAppendable` skips `SlabEntry` rebuild; large path keeps `Extent*` from
+`allocLarge` (no second emap lookup). Fresh 0060 session: `--worst`/`--openworld` worst ≤
+druntime; `--worst-safe` worst still ~+1.2 ms. bullet_hell concurrent max ~1.5 ms, 0 over 16 ms,
+RSS ~2.9 GB. `correctness.sh` OK.
 
 ### Phase 2 falsification numbers
 
