@@ -132,6 +132,26 @@ to fix by tuning (`guide/how-it-works.md`).
 * Other machines. A different CPU, core count or frequency setting moves every number here; compare the collectors on
   the same machine, with `bench/compare.sh`.
 
+## 6. Small live heap, paced engine GC (2026-10-13)
+
+`bench/engine_gc_compare.sh` (two binaries). 16-core Linux, DMD 2.113 `-O -release -inline`, medians of 5
+where noted. Frame time is work only.
+
+| Scenario | druntime mean | steadygc mean | ratio | worst frames | over16 sum |
+|---|---|---|---|---|---|
+| `--worst` (before 0056) | ~5.2 ms | ~8.1 ms | ~1.55× | steady often worse | steady often >0 |
+| `--worst` (after 0056) | ~5.3–5.6 ms | ~6.5–7.1 ms | ~1.23–1.27× | often ≤ druntime | often 0 |
+| `--openworld` (after 0056) | ~0.53–0.59 ms | ~0.70–0.77 ms | ~1.3× | mixed | 0 |
+| `--worst-safe` (after 0056) | ~2.7 ms | ~2.7 ms | ~1.0× | ~7 ms both | 0 |
+
+Acceptance (mean ≤1.2× on `--worst` and `--openworld`) is **not** met yet on this machine. Mutator
+`format`/`qalloc` remains the mean gap; bullet_hell_stress concurrent worst ~2.1 ms, 0 over 16 ms,
+RSS ~2.9 GB (no regression vs the large-heap bar).
+
+```sh
+DC=path/to/dmd bash bench/engine_gc_compare.sh
+```
+
 ## Reproduce
 
 ```sh
