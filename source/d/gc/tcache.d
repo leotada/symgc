@@ -47,6 +47,22 @@ private:
 	uint appendSlotSize;
 	uint appendEpoch;
 
+	/**
+	 * Last page looked up for appendable metadata writes. Many successive
+	 * allocAppendable hits share one slab page; skip the emap walk on that hit.
+	 */
+	PageDescriptor pdCachePD;
+	void* pdCachePage;
+
+	/**
+	 * BlkInfo for the allocation this thread just made. `GC.qalloc` (Appender,
+	 * format) re-queries the block; the emap + metadata bit dominate that path
+	 * on small heaps. Valid only until the next alloc/free on this thread.
+	 */
+	void* lastBlkPtr;
+	size_t lastBlkSize;
+	uint lastBlkAttr;
+
 	package CachedExtentMap emap;
 
 	/**
@@ -306,6 +322,11 @@ public:
 		}
 
 		asize = max(asize, 2 * Quantum);
+		// Short format/appender: one qalloc covers a typical line.
+		if (finalizer is null && !containsPointers) {
+			asize = max(asize, 64);
+		}
+
 		assert(sizeClassSupportsMetadata(getSizeClass(asize)),
 		       "allocAppendable got size class without metadata support!");
 
@@ -315,9 +336,22 @@ public:
 				return null;
 			}
 
-			auto pd = getPageDescriptor(ptr);
-			auto si = SlabAllocInfo(pd, ptr);
-			si.initializeMetadata(finalizer, size);
+			// Fresh slot: write metadata without probing hasMetadata (atomic load).
+			// Page-descriptor cache hits when many appendable allocs share a slab.
+			auto pd = getPageDescriptorCached(ptr);
+			auto se = SlabEntry(pd, ptr);
+			auto slotSize = binInfos[se.sizeClass].slotSize;
+			writeNewSlotMetadata(pd.extent, se.index, slotSize,
+			                     se.computeAddress(), finalizer, size);
+			// BlkAttr bits (core.memory): APPENDABLE=8, NO_SCAN=2, FINALIZE=1.
+			uint attr = 0b1000;
+			if (!containsPointers) {
+				attr |= 0b0010;
+			}
+			if (finalizer !is null) {
+				attr |= 0b0001;
+			}
+			noteLastBlk(ptr, slotSize - (finalizer !is null ? PointerSize : 0), attr);
 			return ptr;
 		}
 
@@ -331,6 +365,14 @@ public:
 		auto e = pd.extent;
 		e.setUsedCapacity(size);
 		e.setFinalizer(finalizer);
+		uint attr = 0b1000;
+		if (!containsPointers) {
+			attr |= 0b0010;
+		}
+		if (finalizer !is null) {
+			attr |= 0b0001;
+		}
+		noteLastBlk(ptr, e.size, attr);
 		return ptr;
 	}
 
@@ -571,9 +613,23 @@ public:
 		// Whether the block has a used capacity of its own, which a plain block
 		// does not: a large one then has all its pages used. Resizing must not
 		// turn a plain block into an appendable one (see `hook_fetchAllocInfo`).
-		bool appendable = ec.isSlab()
-			? SlabAllocInfo(pd, ptr).hasMetadata
-			: pd.extent.usedCapacity != pd.extent.size;
+		bool appendable = false;
+		Finalizer oldFinalizer = null;
+		size_t oldUsedCapacity = 0;
+		if (ec.isSlab()) {
+			auto si0 = SlabAllocInfo(pd, ptr);
+			appendable = si0.hasMetadata;
+			if (appendable) {
+				oldFinalizer = si0.finalizer;
+				oldUsedCapacity = si0.usedCapacity;
+			}
+		} else {
+			oldUsedCapacity = pd.extent.usedCapacity;
+			appendable = oldUsedCapacity != pd.extent.size;
+			if (appendable) {
+				oldFinalizer = pd.extent.finalizer;
+			}
+		}
 
 		if (ec.isSlab()) {
 			auto newSizeClass = getSizeClass(size);
@@ -598,7 +654,11 @@ public:
 			}
 
 			if (newSizeClass > oldSizeClass) {
-				copySize = getSizeFromClass(oldSizeClass);
+				// Appendable: copy only the used prefix so we do not overwrite
+				// the new slot's metadata with the old slot's trailer.
+				copySize = appendable
+					? min(size, oldUsedCapacity)
+					: getSizeFromClass(oldSizeClass);
 			}
 		} else {
 			auto e = pd.extent;
@@ -635,14 +695,14 @@ public:
 			copySize = min(size, e.usedCapacity);
 		}
 
-		auto newPtr = alloc(size, containsPointers, false);
+		// Keep APPENDABLE / finalizer on the new block. Plain alloc() left
+		// small appendable growth without metadata, so later ~= paid a fresh
+		// allocation every time (format/appender hot path on small heaps).
+		void* newPtr = appendable
+			? allocAppendable(size, containsPointers, false, oldFinalizer)
+			: alloc(size, containsPointers, false);
 		if (newPtr is null) {
 			return null;
-		}
-
-		if (appendable && !isSmallSize(size)) {
-			auto npd = getPageDescriptor(newPtr);
-			npd.extent.setUsedCapacity(size);
 		}
 
 		import core.stdc.string : memcpy;
@@ -671,27 +731,40 @@ private:
 
 		import d.gc.slab;
 		auto sizeClass = getSizeClass(size);
-		auto slotSize = binInfos[sizeClass].slotSize;
+		return allocSmallInClass(sizeClass, containsPointers, zero, size);
+	}
 
-		auto ptr = allocSmallBin(sizeClass, slotSize, containsPointers);
+	void* allocSmallInClass(ubyte sizeClass, bool containsPointers, bool zero,
+	                        size_t clearSize = size_t.max) {
+		import d.gc.slab;
+		auto slotSize = binInfos[sizeClass].slotSize;
+		if (clearSize == size_t.max || clearSize > slotSize) {
+			clearSize = slotSize;
+		}
+
+		bool wasZeroed;
+		auto ptr = allocSmallBin(sizeClass, slotSize, containsPointers, wasZeroed);
 		if (unlikely(ptr is null)) {
 			return null;
 		}
 
 		version(Symgc_verify) {
 			import d.gc.verify;
-			checkSlotOnAlloc(ptr, size, slotSize);
+			checkSlotOnAlloc(ptr, clearSize, slotSize);
 		}
 
 		import core.stdc.string : memset;
+		// Pointer bins memset on free; skip a second full clear when we can.
 		if (unlikely(zero)) {
-			memset(ptr, 0, slotSize);
-		} else if (containsPointers) {
-			// Clear out any data that was not requested.
-			memset(ptr + size, 0, slotSize - size);
+			if (!wasZeroed) {
+				memset(ptr, 0, slotSize);
+			}
+		} else if (containsPointers && !wasZeroed) {
+			memset(ptr + clearSize, 0, slotSize - clearSize);
 		}
 
 		triggerAllocationEvent(slotSize);
+		noteLastBlk(ptr, slotSize, containsPointers ? 0 : 0b0010);
 		return ptr;
 	}
 
@@ -699,7 +772,8 @@ private:
 		return 2 * sizeClass | containsPointers;
 	}
 
-	void* allocSmallBin(ubyte sizeClass, uint slotSize, bool containsPointers) {
+	void* allocSmallBin(ubyte sizeClass, uint slotSize, bool containsPointers,
+	                    ref bool wasZeroed) {
 		assert(slotSize == binInfos[sizeClass].slotSize, "Invalid slot size!");
 		assert(!isScanningThread, "Trying to free while in scanning thread!");
 
@@ -709,9 +783,11 @@ private:
 		auto bin = &bins[index];
 
 		void* ptr;
-		if (likely(bin.allocate(ptr))) {
+		if (likely(bin.allocate(ptr, wasZeroed))) {
 			return ptr;
 		}
+
+		wasZeroed = false;
 
 		// The slow path: time lost to memory management.
 		import d.gc.gctime;
@@ -737,7 +813,7 @@ private:
 		if (ranCycle) {
 			// The bin might have gained a pointer through a
 			// finalizer.
-			if (bin.allocate(ptr)) {
+			if (bin.allocate(ptr, wasZeroed)) {
 				return ptr;
 			}
 		}
@@ -763,6 +839,7 @@ private:
 			bin.refill(emap, arena, binStates[index], sizeClass, slotSize);
 		}
 
+		wasZeroed = false;
 		if (bin.allocateEasy(ptr)) {
 			return ptr;
 		}
@@ -785,7 +862,8 @@ private:
 		triggerDeallocationEvent(slotSize);
 
 		// If the allocation contains pointers, zero it before freeing it
-		if (ShouldZeroFreeSlabs && pd.containsPointers) {
+		const zeroedOnFree = ShouldZeroFreeSlabs && pd.containsPointers;
+		if (zeroedOnFree) {
 			import core.stdc.string : memset;
 			memset(ptr, 0, slotSize);
 		}
@@ -820,7 +898,7 @@ private:
 
 		auto index = getBinIndex(sc, pd.containsPointers);
 		auto bin = &bins[index];
-		if (likely(bin.free(ptr))) {
+		if (likely(zeroedOnFree ? bin.freeZeroed(ptr) : bin.free(ptr))) {
 			return;
 		}
 
@@ -832,7 +910,7 @@ private:
 			bin.flushToFree(emap, binStates[index]);
 		}
 
-		auto success = bin.free(ptr);
+		auto success = zeroedOnFree ? bin.freeZeroed(ptr) : bin.free(ptr);
 		assert(success, "Unable to free!");
 	}
 
@@ -864,10 +942,35 @@ private:
 			return null;
 		}
 
-		triggerAllocationEvent(pages * PageSize);
+		auto nbytes = pages * PageSize;
+		triggerAllocationEvent(nbytes);
+		noteLastBlk(ptr, nbytes, containsPointers ? 0 : 0b0010);
 		return ptr;
 	}
 
+	void noteLastBlk(void* ptr, size_t blkSize, uint attr) nothrow {
+		lastBlkPtr = ptr;
+		lastBlkSize = blkSize;
+		lastBlkAttr = attr;
+	}
+
+public:
+	/**
+	 * If `ptr` is the block this thread just allocated, return its BlkInfo
+	 * without an emap lookup. Clears the hit so a later free cannot observe it.
+	 */
+	bool consumeLastBlk(void* ptr, ref size_t blkSize, ref uint attr) nothrow {
+		if (ptr !is lastBlkPtr || ptr is null) {
+			return false;
+		}
+
+		blkSize = lastBlkSize;
+		attr = lastBlkAttr;
+		lastBlkPtr = null;
+		return true;
+	}
+
+private:
 	void freeLarge(PageDescriptor pd) {
 		assert(!pd.isSlab(), "Slab are not supported!");
 		assert(!isScanningThread, "Trying to free while in scanning thread!");
@@ -1172,6 +1275,27 @@ private:
 		return pd.arena.growLarge(emap, pd.extent, npages);
 	}
 
+public:
+	/**
+	 * In-place grow for `GC.extend` (Appender large buffers). Returns false
+	 * when the arena cannot attach more pages to this extent.
+	 */
+	bool growLargeForExtend(PageDescriptor pd, uint npages) {
+		auto oldPages = pd.extent.npages;
+		if (npages <= oldPages) {
+			return true;
+		}
+
+		if (!growLarge(pd, npages)) {
+			return false;
+		}
+
+		triggerAllocationEvent((npages - oldPages) * PageSize);
+		return true;
+	}
+
+private:
+
 	bool shrinkLarge(PageDescriptor pd, uint npages) {
 		state.enterBusyState();
 		scope(exit) state.exitBusyState();
@@ -1184,6 +1308,23 @@ private:
 		assert(pd.extent !is null);
 		assert(pd.isSlab() || ptr is pd.extent.address);
 
+		return pd;
+	}
+
+	/**
+	 * Same as getPageDescriptor, but remembers the last page. Appendable
+	 * allocs from one slab share a page; the emap leaf is already cached in
+	 * CachedExtentMap, and this avoids even that for the common hit.
+	 */
+	auto getPageDescriptorCached(void* ptr) {
+		auto aptr = alignDown(ptr, PageSize);
+		if (likely(aptr is pdCachePage) && pdCachePD.extent !is null) {
+			return pdCachePD;
+		}
+
+		auto pd = getPageDescriptor(ptr);
+		pdCachePage = aptr;
+		pdCachePD = pd;
 		return pd;
 	}
 

@@ -51,6 +51,13 @@ private:
 	ushort _low_water;
 	ushort _available;
 	ushort _bottom;
+	/**
+	 * How many of the slots at the allocate end (LIFO) were zeroed on free.
+	 * Pointer bins memset on free (`ShouldZeroFreeSlabs`); skipping a second
+	 * memset on the next alloc of those slots cuts the small-heap mutator cost.
+	 * Cleared when refill inserts non-zeroed slots from the arena.
+	 */
+	ushort _zeroed;
 
 public:
 	this(void*[] buffer) {
@@ -73,6 +80,25 @@ public:
 		return allocateImpl!true(ptr);
 	}
 
+	/**
+	 * Like allocate, and set `wasZeroed` if this slot was memset on free.
+	 */
+	bool allocate(ref void* ptr, ref bool wasZeroed) {
+		if (!allocateImpl!true(ptr)) {
+			wasZeroed = false;
+			return false;
+		}
+
+		if (_zeroed > 0) {
+			_zeroed--;
+			wasZeroed = true;
+		} else {
+			wasZeroed = false;
+		}
+
+		return true;
+	}
+
 	void refill(ref CachedExtentMap emap, shared(Arena)* arena,
 	            ref ThreadBinState state, ubyte sizeClass, size_t slotSize) {
 		auto nfill = state.getFill(nmax);
@@ -84,10 +110,12 @@ public:
 		auto requested = insert + (nfill >> 1) + 1;
 		assert(insert < requested && requested <= _head);
 
+		// Arena slots are not zeroed; any previously tracked frees are mixed in.
+		_zeroed = 0;
+
 		auto filled = arena.batchAllocSmall(emap, sizeClass, _head, insert,
 		                                    requested, slotSize);
 		state.onRefill();
-
 		/**
 		 * Note: If we are worried about security, we might want to shuffle
 		 *       our allocations around. This makes the uses of techniques
@@ -130,6 +158,18 @@ public:
 		}
 
 		*(--_head) = ptr;
+		return true;
+	}
+
+	/**
+	 * Free a slot that was memset to zero (pointer-containing frees).
+	 */
+	bool freeZeroed(void* ptr) {
+		if (!free(ptr)) {
+			return false;
+		}
+
+		_zeroed++;
 		return true;
 	}
 
@@ -325,6 +365,11 @@ private:
 		_head = top - nretain;
 		if (nretain < nlowWater) {
 			_low_water = current;
+		}
+
+		// Kept slots are the LIFO allocate end; clamp the zeroed count.
+		if (_zeroed > nretain) {
+			_zeroed = cast(ushort) nretain;
 		}
 
 		// Move the remaining items on top of the stack if necessary.

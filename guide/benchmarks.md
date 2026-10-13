@@ -250,6 +250,40 @@ session of the tables above, whose city worst frame was 9.7 ms). The 2 GiB stres
 and the correctness battery passes (`mark_race` 11.6M moves, `mark_race_glue` 2.6M, `finalizer_order`, `thread_exit_race`), and the collector still
 compiles for Android, Windows and arm64 Linux (not run there).
 
+## Small-heap paced engine GC (2026-10-13)
+
+Paced `bench/engine_gc_benchmark.d` via `bench/engine_gc_compare.sh` (two binaries). Machine: 16 cores,
+Linux 6.12, DMD 2.113 `-O -release -inline`. Frame time is work only; 60 Hz sleep is not included.
+
+### Phase 1 attribution (--worst, one run each, after harness)
+
+| | mean | quiet residual | alloc timer sum | collect timer | pause | user CPU (compare) |
+|---|---|---|---|---|---|---|
+| druntime `precise:1` | ~5.1 ms | (no frameStats) | — | — | — | ~4.7 s |
+| steadygc | ~8.0 ms before fixes; ~6.3–6.5 ms after | ~6.0–7.7 ms | ~0.22 ms/frame | small | small | ~7.4 s |
+
+**Mutator bucket:** Quiet-frame residual dominates the mean. `threadAllocTime` only covers bin-miss /
+large alloc; the hot path is Appender/`format` → `GC.qalloc` (appendable NO_SCAN) plus metadata writes.
+Microbenches with `GC.disable`: `new Node` ties; `new char[]` nearly ties; `format` was ~1.6× until
+qalloc BlkInfo cache + appendable `realloc` fix + mid-size NO_SCAN size floor.
+
+**Other-thread bucket:** `totalCollectionTime` (~0.7–0.8 s cycle wall) and markers explain process
+user CPU above mutator frame sum, and the cycle-frame tail — not the quiet median. Confirmed:
+`SYMGC_CONCURRENT_MARK=0` leaves quiet residual ~unchanged; `SYMGC_SWEEP_DUTY=1` does not cut the mean;
+`-version=Symgc_sync_sweep` makes --worst worse (more over-budget frames). `strace -c -e madvise`:
+~60 calls / ~0.6 ms per --worst run — hypothesis 2 (purge) dropped.
+
+### Phase 2 falsification numbers
+
+| Experiment | Result |
+|---|---|
+| Micro A (class list) | steadygc ≤ druntime |
+| Micro B (`new int[](32)`) | ~1.1–1.2× |
+| Micro C (large scanned `PtrVert[]`) | with GC on much slower (mark); with GC.disable ties |
+| `SYMGC_SWEEP_DUTY=1` | mean not improved |
+| `Symgc_sync_sweep` | mean 7.0 ms, 40 frames >16 ms on --worst — worse |
+| `madvise` count | ≪ 0.2 s — drop H2 |
+
 ## Reproducing
 
 ```sh
@@ -257,6 +291,9 @@ compiles for Android, Windows and arm64 Linux (not run there).
 git -C symgc archive 4a4cb2b source | tar -x -C /tmp/upstream-symgc
 plans/bench/core_bench/dmd_bench.sh /tmp/bench-out /tmp/upstream-symgc/source
 cat /tmp/bench-out/results.txt
+
+# paced small-heap engine benchmark (two binaries)
+DC=path/to/dmd bash symgc/bench/engine_gc_compare.sh
 ```
 
 The run takes about an hour. Each line of `results.txt` is one run: the frame statistics in microseconds, the peak

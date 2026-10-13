@@ -256,41 +256,9 @@ public:
 
 	void initializeMetadata(Finalizer initialFinalizer,
 	                        size_t initialUsedCapacity) {
-		assert(isLittleEndian(), "Currently does not work on big-endian!");
 		assert(supportsMetadata, "size class not supports slab metadata!");
-
-		bool hasFinalizer = initialFinalizer !is null;
-		assert(
-			initialUsedCapacity <= slotSize - (hasFinalizer ? PointerSize : 0),
-			"Insufficient alloc capacity!"
-		);
-
-		auto finalizerValue = cast(size_t) cast(void*) initialFinalizer;
-		assert((finalizerValue & AddressMask) == finalizerValue,
-		       "New finalizer pointer is invalid!");
-
-		auto freeSpaceValue = slotSize - initialUsedCapacity;
-		ushort native;
-		if (freeSpaceValue == 1) {
-			assert(!hasFinalizer);
-			native = SingleByteBit;
-		} else {
-			auto finalizerSet = hasFinalizer ? FinalizerBit : 0;
-			native = (freeSpaceValue | finalizerSet) & ushort.max;
-		}
-
-		auto newMetadata = size_t(native) << 48;
-
-		// TODO: Currently only works on little-endian!!!
-		// On a big-endian machine, the unused high 16 bits of a pointer will be
-		// found at the start, rather than end, of the memory that it occupies,
-		// and the freespace (newMetadata) will collide with the finalizer.
-		slotMetadata.data.finalizerData = newMetadata | finalizerValue;
-		if (hasFinalizer) {
-			e.setHasFinalizers();
-		}
-
-		e.enableMetadata(index);
+		writeNewSlotMetadata(e, index, slotSize, cast(void*) address,
+		                     initialFinalizer, initialUsedCapacity);
 		_hasMetadata = true;
 	}
 
@@ -346,6 +314,61 @@ private:
 		 */
 		return _hasMetadata && slotMetadata.hasFinalizer;
 	}
+}
+
+/**
+ * Write appendable/finalizer metadata into a freshly allocated slot.
+ * Skips the hasMetadata probe that constructing SlabAllocInfo would do;
+ * the slot must not already carry metadata.
+ */
+/**
+ * Write the slot trailer only; the caller sets the extent metadata bit
+ * (possibly batched).
+ */
+void writeNewSlotMetadataBody(Extent* e, uint index, uint slotSize, void* address,
+                              Finalizer initialFinalizer,
+                              size_t initialUsedCapacity) {
+	assert(isLittleEndian(), "Currently does not work on big-endian!");
+
+	bool hasFinalizer = initialFinalizer !is null;
+	assert(
+		initialUsedCapacity <= slotSize - (hasFinalizer ? PointerSize : 0),
+		"Insufficient alloc capacity!"
+	);
+
+	auto finalizerValue = cast(size_t) cast(void*) initialFinalizer;
+	assert((finalizerValue & AddressMask) == finalizerValue,
+	       "New finalizer pointer is invalid!");
+
+	auto freeSpaceValue = slotSize - initialUsedCapacity;
+	ushort native;
+	if (freeSpaceValue == 1) {
+		assert(!hasFinalizer);
+		native = SingleByteBit;
+	} else {
+		auto finalizerSet = hasFinalizer ? FinalizerBit : 0;
+		native = (freeSpaceValue | finalizerSet) & ushort.max;
+	}
+
+	auto newMetadata = size_t(native) << 48;
+
+	// TODO: Currently only works on little-endian!!!
+	// On a big-endian machine, the unused high 16 bits of a pointer will be
+	// found at the start, rather than end, of the memory that it occupies,
+	// and the freespace (newMetadata) will collide with the finalizer.
+	SlotMetadata.fromBlock(address, slotSize).data.finalizerData =
+		newMetadata | finalizerValue;
+	if (hasFinalizer) {
+		e.setHasFinalizers();
+	}
+}
+
+void writeNewSlotMetadata(Extent* e, uint index, uint slotSize, void* address,
+                          Finalizer initialFinalizer,
+                          size_t initialUsedCapacity) {
+	writeNewSlotMetadataBody(e, index, slotSize, address, initialFinalizer,
+	                         initialUsedCapacity);
+	e.enableMetadata(index);
 }
 
 @"SlabAllocInfo" unittest {
