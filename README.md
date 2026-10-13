@@ -1,6 +1,6 @@
-# oneday: a garbage collector for D that does not stop your game
+# steadygc: a garbage collector for D that does not stop your game
 
-oneday is a fork of [symgc](https://github.com/symmetryinvestments/symgc), the [SDC](https://github.com/snazzy-d/sdc)
+steadygc is a fork of [symgc](https://github.com/symmetryinvestments/symgc), the [SDC](https://github.com/snazzy-d/sdc)
 garbage collector ported to ordinary D. It keeps symgc's allocator (no global lock) and moves the two expensive parts
 of a collection, the **mark** and the **sweep**, beside the program. A game written the ordinary D way, with `new`,
 closures, `~=` and associative arrays and no pools, should not lose a frame to the collector.
@@ -17,8 +17,8 @@ pools (Ryzen 7 3800X, Linux 6.12, DMD 2.113):
 |---|---|---|---|
 | druntime's GC | 141 ms | 138 ms | 4 |
 | Upstream symgc | 28.0 ms | 24.7 ms | 3 |
-| **oneday** (DMD, no compiler change) | **1.3 ms** | 1.1 ms | **0** |
-| **oneday** (LDC with the card barrier) | **0.87 ms** | 0.77 ms | **0** |
+| **steadygc** (DMD, no compiler change) | **1.3 ms** | 1.1 ms | **0** |
+| **steadygc** (LDC with the card barrier) | **0.87 ms** | 0.77 ms | **0** |
 | No collection at all (the game's own cost) | 0.98 ms | 0.97 ms | 0 |
 
 And a city builder with six job threads allocating, 500,000 citizens, 2 GiB of assets, 60 s:
@@ -27,8 +27,8 @@ And a city builder with six job threads allocating, 500,000 citizens, 2 GiB of a
 |---|---|---|---|---|
 | druntime's GC | 9.1 ms | 137-193 ms | 37 | 3.0 GB |
 | Upstream symgc | 3.8 ms | 107-113 ms | 40 | 2.8 GB |
-| **oneday** (DMD) | 4.3 ms | **9.7 ms** | **0** | 3.6 GB |
-| **oneday** (LDC with the card barrier) | 3.1 ms | **6.9 ms** | **0** | 3.1 GB |
+| **steadygc** (DMD) | 4.3 ms | **9.7 ms** | **0** | 3.6 GB |
+| **steadygc** (LDC with the card barrier) | 3.1 ms | **6.9 ms** | **0** | 3.1 GB |
 
 The price is memory: the heap keeps growing while a cycle runs beside the program, so the peak is higher than upstream's
 (3.6 GB against 2.8-3.0 GB in the city model, 11.3 GB against 10.9 GB at the 8 GiB level). All numbers, conditions and the commands that produced them: [`BENCHMARKS.md`](BENCHMARKS.md).
@@ -38,7 +38,7 @@ The price is memory: the heap keeps growing while a cycle runs beside the progra
 Linux, DMD 2.112+ (or the project's DMD, see below). In an empty directory:
 
 ```sh
-git clone <this repository> symgc
+git clone https://github.com/leotada/symgc
 mkdir -p source && cat > source/app.d <<'EOF'
 import symgc.gcobj;                                          // links the collector in
 extern(C) __gshared string[] rt_options = ["gcopt=gc:sdc"];  // selects it
@@ -81,6 +81,8 @@ Always build in release mode (`-b release`): the collector is compiled with your
 | **E. LDC with the card barrier** | An LDC built from the `gc-card-marking` branch | The concurrent mark on any kernel, without page faults, with the lowest tail | [`guide/usage.md`](guide/usage.md#e-ldc-with-the-card-barrier) |
 | **F. DMD with `-preview=gcbarrier`** | A dmd built from the fork | The same card barrier in DMD, for programs that cannot move to LDC | [`guide/usage.md`](guide/usage.md#f-dmd-with--previewgcbarrier) |
 
+D, E and F need the compiler forks, [leotada/dmd](https://github.com/leotada/dmd) and
+[leotada/ldc](https://github.com/leotada/ldc); [`guide/usage.md`](guide/usage.md#where-the-code-is) says which branch.
 Start with A or B. Move to E or F if page faults from the kernel tracker show up in your frame times (a game that
 writes to the pages of tens of thousands of live objects every frame) or your kernel is older than 6.7.
 
@@ -173,7 +175,7 @@ patch, with the measurement behind each change, in [`guide/`](guide/) and the pa
 
 # Upstream README: SDC Garbage collector, ported to normal D
 
-> The text below is upstream symgc's README. It still describes the base collector; oneday's own documentation is above
+> The text below is upstream symgc's README. It still describes the base collector; steadygc's own documentation is above
 > and in [`guide/README.md`](guide/README.md).
 
 This is a port of the [SDC](https://github.com/snazzy-d/sdc) garbage collector to D code that builds with DMD/LDC/gdc.

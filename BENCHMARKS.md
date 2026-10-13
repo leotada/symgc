@@ -17,9 +17,9 @@ other tables and the history of each change.
 |---|---|---|
 | druntime GC | druntime's conservative GC (same binary, no `gcopt`) | — |
 | upstream symgc | symgc before this work | — (stop-the-world) |
-| oneday, STW mark | this fork, `SYMGC_CONCURRENT_MARK=0` | none: the mark stops the program, the sweep does not |
-| oneday | this fork, concurrent mark | the kernel's dirty pages (Linux 6.7+) |
-| oneday, LDC + cards | this fork, concurrent mark | the compiler's card barrier |
+| steadygc, STW mark | this fork, `SYMGC_CONCURRENT_MARK=0` | none: the mark stops the program, the sweep does not |
+| steadygc | this fork, concurrent mark | the kernel's dirty pages (Linux 6.7+) |
+| steadygc, LDC + cards | this fork, concurrent mark | the compiler's card barrier |
 
 ## 1. A shooter with a lot of garbage
 
@@ -30,17 +30,17 @@ garbage, a level of 2 or 8 GiB alive. 30 s, 1,800 frames.
 |---|---|---|---|---|---|---|
 | druntime GC | 0.18 ms | 0.70 ms | 138 ms | 139-141 ms | 4 | 4.4 GB |
 | upstream symgc | 0.20 ms | 0.99 ms | 24.7 ms | 28.0 ms | 3 | 3.0 GB |
-| oneday, STW mark | 0.21 ms | 0.94 ms | 10.3 ms | 11.1 ms | 0 | 3.0 GB |
-| **oneday** | 0.22 ms | 0.98 ms | 1.1 ms | **1.2-1.3 ms** | 0 | 3.0 GB |
-| **oneday, LDC + cards** | 0.11 ms | 0.63 ms | 0.77 ms | **0.87 ms** | 0 | 3.0 GB |
+| steadygc, STW mark | 0.21 ms | 0.94 ms | 10.3 ms | 11.1 ms | 0 | 3.0 GB |
+| **steadygc** | 0.22 ms | 0.98 ms | 1.1 ms | **1.2-1.3 ms** | 0 | 3.0 GB |
+| **steadygc, LDC + cards** | 0.11 ms | 0.63 ms | 0.77 ms | **0.87 ms** | 0 | 3.0 GB |
 | No collection at all | 0.18 ms | 0.80 ms | 0.97 ms | 0.98 ms | 0 | 4.8 GB, growing |
 
 | 8 GiB level | p50 | p99.9 | Worst | Over 16 ms | Peak memory |
 |---|---|---|---|---|---|
 | druntime GC | 0.18 ms | 539 ms | 548 ms | 2 | 16.9 GB |
 | upstream symgc | 0.20 ms | 1.25 ms | 63.6 ms | 1 | 10.9 GB |
-| **oneday** | 0.21 ms | 1.19 ms | **1.22 ms** | 0 | 11.3 GB |
-| **oneday, LDC + cards** | 0.11 ms | 0.84 ms | **0.84 ms** | 0 | 11.3 GB |
+| **steadygc** | 0.21 ms | 1.19 ms | **1.22 ms** | 0 | 11.3 GB |
+| **steadygc, LDC + cards** | 0.11 ms | 0.84 ms | **0.84 ms** | 0 | 11.3 GB |
 
 Under DMD, with no compiler change, the worst frame is within 0.3 ms of the game with no collector at 2 and at 8 GiB.
 At 8 GiB a stop-the-world collector runs only once or twice in 30 s, so its p99.9 looks fine and its worst frame does
@@ -57,9 +57,9 @@ threads, 2 GiB of assets, 60 s (3,600 frames).
 |---|---|---|---|---|---|
 | druntime GC | 9.1 ms | 131-152 ms | 137-193 ms | 37 | 3.0 GB |
 | upstream symgc | 3.8 ms | 107-109 ms | 107-113 ms | 40 | 2.8 GB |
-| oneday, STW mark | 3.6 ms | 57.9 ms | 60.7 ms | 25 | 3.3 GB |
-| **oneday** | 4.3 ms | 8.6-8.9 ms | **9.7 ms** | 0 | 3.6 GB |
-| **oneday, LDC + cards** | 3.1 ms | 5.8 ms | **6.9 ms** | 0 | 3.1 GB |
+| steadygc, STW mark | 3.6 ms | 57.9 ms | 60.7 ms | 25 | 3.3 GB |
+| **steadygc** | 4.3 ms | 8.6-8.9 ms | **9.7 ms** | 0 | 3.6 GB |
+| **steadygc, LDC + cards** | 3.1 ms | 5.8 ms | **6.9 ms** | 0 | 3.1 GB |
 
 **Other models** (DMD, one run each; median / p99.9 / worst / frames over 16 ms):
 
@@ -67,17 +67,17 @@ threads, 2 GiB of assets, 60 s (3,600 frames).
 |---|---|---|---|
 | druntime GC | 1.74 / 31.9 / 40.4 ms / 18 | 2.60 / 10.8 / 13.2 ms / 0 | 0.29 / 14.9 / 16.6 ms / 2 |
 | upstream symgc | 1.12 / 45.0 / 48.5 ms / 14 | 2.21 / 33.5 / 36.9 ms / 14 | 0.29 / 0.64 / 14.1 ms / 0 |
-| **oneday** | 1.13 / 2.73 / 3.68 ms / 0 | 2.45 / 4.13 / 4.71 ms / 0 | 0.30 / 0.64 / 1.34 ms / 0 |
+| **steadygc** | 1.13 / 2.73 / 3.68 ms / 0 | 2.45 / 4.13 / 4.71 ms / 0 | 0.30 / 0.64 / 1.34 ms / 0 |
 
 With several threads allocating, the allocator matters as much as the pauses: druntime's GC takes one lock for every
-allocation. oneday keeps every frame of every model under 10 ms. The price is memory (3.6 GB against 3.0 GB in the 500k
+allocation. steadygc keeps every frame of every model under 10 ms. The price is memory (3.6 GB against 3.0 GB in the 500k
 city), because the heap keeps growing while a cycle runs beside the program.
 
 ## 3. Allocation throughput
 
 `gcb.d`, one binary with and without `gcopt`, medians of three (DMD):
 
-| Workload | druntime GC | oneday | Ratio |
+| Workload | druntime GC | steadygc | Ratio |
 |---|---|---|---|
 | One thread allocating small objects | 19.6 M/s | 15.5 M/s | 0.79x |
 | Eight threads | 4.2 M/s | 36.0 M/s | **8.6x** |
@@ -141,5 +141,5 @@ bench/compare.sh gcb.d alloc 8 4000000                             # section 3
 bench/compare.sh entity_init.d 60 1024 20000 2000 60               # section 5
 ```
 
-`compare.sh` runs the druntime GC, oneday with a stop-the-world mark and oneday with the concurrent mark on the same
+`compare.sh` runs the druntime GC, steadygc with a stop-the-world mark and steadygc with the concurrent mark on the same
 binary. The LDC and card-barrier rows need the project's compiler builds (`guide/usage.md`, recipes E and F).

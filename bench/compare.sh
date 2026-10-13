@@ -7,7 +7,7 @@
 #   bench/compare.sh aaa_sim.d city 60 2048 6 0 500000                # a city builder, six job threads
 #   bench/compare.sh entity_init.d 30 1024 20000 2000 60              # a scene of 10 million linked entities
 #
-# Runs: druntime's GC; oneday with a stop-the-world mark; oneday with the concurrent mark. A frame-based program
+# Runs: druntime's GC; steadygc with a stop-the-world mark; steadygc with the concurrent mark. A frame-based program
 # prints frame_p50_us=... p99=... p999=... max=... over16ms=...: compare "max" first, it is the frame that was
 # missed. Environment: DC, SYMGC, EXTRA as for build.sh; WORK is the directory for the binary.
 set -eu
@@ -29,5 +29,5 @@ run() {
 }
 
 run "druntime GC"        "$bin" "$@"
-run "oneday, STW mark"   env SYMGC_CONCURRENT_MARK=0 "$bin" "$@" --DRT-gcopt=gc:sdcq
-run "oneday, concurrent" "$bin" "$@" --DRT-gcopt=gc:sdcq
+run "steadygc, STW mark"   env SYMGC_CONCURRENT_MARK=0 "$bin" "$@" --DRT-gcopt=gc:sdcq
+run "steadygc, concurrent" "$bin" "$@" --DRT-gcopt=gc:sdcq

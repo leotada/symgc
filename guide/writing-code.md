@@ -1,4 +1,4 @@
-# Writing code for oneday
+# Writing code for steadygc
 
 The point of a collector that does not stop the program is that game code can be written the ordinary D way. This
 page lists what that means in practice, the few things that still cost more than the collector, how to use the
@@ -94,7 +94,7 @@ reports memory pressure (on Android, `onTrimMemory`).
 
 ## C libraries
 
-C libraries such as SDL, OpenGL, OpenAL and raylib have run under oneday, with D pointers held by C code. The rules:
+C libraries such as SDL, OpenGL, OpenAL and raylib have run under steadygc, with D pointers held by C code. The rules:
 
 * **Holding and reading D pointers from C is fine**, as long as the object is also reachable from D (a global, a
   field, `GC.addRoot`), exactly as with druntime's GC.

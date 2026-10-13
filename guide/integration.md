@@ -1,13 +1,13 @@
-# Using oneday in a project
+# Using steadygc in a project
 
-This guide gets oneday into a D program with DMD, LDC or GDC, shows how to select it, and how to check it is the
+This guide gets steadygc into a D program with DMD, LDC or GDC, shows how to select it, and how to check it is the
 collector actually running. Read `platforms.md` first if you are not on Linux x86-64.
 
 ## 1. Pick a setup
 
 | Setup | Compiler | What you install | What you get |
 |---|---|---|---|
-| **Plugin** | Stock DMD 2.112+, or LDC with a 2.112+ frontend | Nothing; oneday is a dub dependency | The allocator without a global lock, the concurrent paced sweep, and on Linux 6.7+ the concurrent mark through the kernel tracker. Elsewhere the mark is a pause |
+| **Plugin** | Stock DMD 2.112+, or LDC with a 2.112+ frontend | Nothing; steadygc is a dub dependency | The allocator without a global lock, the concurrent paced sweep, and on Linux 6.7+ the concurrent mark through the kernel tracker. Elsewhere the mark is a pause |
 | **Plugin + this project's druntime** | DMD 2.113 built from this project | A dmd and Phobos build | The same, plus the game-engine calls (`GC.frameStats`, `excludeCurrentThread`, `step`, `defrag`) |
 | **Card barrier** | LDC built from this project's `gc-card-marking` branch | An LDC build with its runtime | The concurrent mark on any Linux kernel without page faults, the lowest tail, and the game-engine calls |
 | **Card barrier, DMD** | DMD built from this project, with `-preview=gcbarrier` | A dmd, plus druntime and Phobos rebuilt with the flag | The same concurrent mark through cards instead of the kernel tracker: it does not need Linux 6.7+. A pointer store costs about 0.7 to 1 ns more, as with LDC |
@@ -134,7 +134,7 @@ The flag makes DMD's backend mark a card after each store of a pointer into memo
 global: in place (`if ((addr - __sd_gc_card_lo) >> 9 < __sd_gc_card_n) __sd_gc_card_base[...] = 1`), and by calling
 `_d_gcBarrierRange(addr, n)` after a copy or a store of a slice, delegate or struct. The three variables and the range
 function are in druntime (`core.internal.gc.cardbarrier`), and the variables are zero until a collector that wants the
-barrier starts, so with the default GC the cost is a compare. oneday sets up the card table when it starts. The
+barrier starts, so with the default GC the cost is a compare. steadygc sets up the card table when it starts. The
 barrier assumes x86 store ordering (a plain byte store); an AArch64 DMD backend would have to use the call.
 
 **Every piece of D code that stores pointers into the GC heap must carry the flag**, as with LDC: a store made by code
@@ -211,4 +211,4 @@ druntime's own options still apply where they make sense: `--DRT-gcopt=parallel:
 | `symgc: cannot map the card table` or `cannot reserve address space for the heap` at start-up | `vm.overcommit_memory=2`, or an address-space limit (`ulimit -v`) smaller than 2 GiB plus its card table | Use `vm.overcommit_memory` 0 or 1, raise the limit, or build without cards |
 | Out of memory with plenty of RAM free, built with cards | The program used up the window | Raise `SYMGC_HEAP_RESERVE_GIB` |
 | Long pauses that grow with the heap | No write tracking: kernel older than 6.7, no cards, or `SYMGC_CONCURRENT_MARK=0` | Check the setup table above |
-| A crash or a corrupted object only under oneday | A bug, or C code writing GC pointers into GC memory | Rebuild with `-version=Symgc_verify` and report it (`testing.md`) |
+| A crash or a corrupted object only under steadygc | A bug, or C code writing GC pointers into GC memory | Rebuild with `-version=Symgc_verify` and report it (`testing.md`) |

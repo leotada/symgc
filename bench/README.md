@@ -6,7 +6,7 @@ Self-contained: everything here builds against the collector in `../source` and 
 ## Quick start
 
 ```sh
-# One program, three collectors (druntime's GC, oneday with a stop-the-world mark, oneday with a concurrent mark)
+# One program, three collectors (druntime's GC, steadygc with a stop-the-world mark, steadygc with a concurrent mark)
 bench/compare.sh bullet_hell_stress.d 30 2048 100000 0.05 256
 
 # The correctness battery (about two minutes)

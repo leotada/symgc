@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build and run the correctness battery against oneday (the setup without a card barrier).
+# Build and run the correctness battery against steadygc (the setup without a card barrier).
 #
 #   bench/correctness.sh [SECONDS=20]
 #

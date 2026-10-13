@@ -1,6 +1,6 @@
 # Contributing
 
-oneday is a preview. The most useful contribution is a measurement or a bug report from a machine, an operating
+steadygc is a preview. The most useful contribution is a measurement or a bug report from a machine, an operating
 system or a program the author does not have.
 
 ## Reporting

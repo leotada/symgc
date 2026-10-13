@@ -1,10 +1,26 @@
-# Every way to use oneday
+# Every way to use steadygc
 
 Short recipes, one per way of using the collector. `integration.md` has the long explanations of the same steps,
 `writing-code.md` says what to write once it runs, `platforms.md` says where it runs.
 
 In all recipes `$SYMGC` is a clone of this repository. "Checked" means it was run on the project's test machine
 (Linux 6.12, x86-64); "expected" means it follows from what was checked but was not run.
+
+## Where the code is
+
+| Repository | Branch | For |
+|---|---|---|
+| [leotada/symgc](https://github.com/leotada/symgc) | `main` | The collector, this documentation and `bench/`. Recipes A, B and C need only this |
+| [leotada/dmd](https://github.com/leotada/dmd) | [`gc-phase0-discovery`](https://github.com/leotada/dmd/tree/gc-phase0-discovery) | The DMD and druntime of recipes D and F; `plans/` has the patch notes, the RFC and the benchmark sources |
+| [leotada/ldc](https://github.com/leotada/ldc) | [`gc-card-marking`](https://github.com/leotada/ldc/tree/gc-card-marking) | The LDC of recipe E |
+
+```sh
+git clone https://github.com/leotada/symgc
+git clone -b gc-phase0-discovery https://github.com/leotada/dmd      # recipes D and F
+git clone -b gc-card-marking https://github.com/leotada/ldc          # recipe E
+```
+
+Phobos needs no fork: build the stock one against the project's druntime.
 
 ## Pick one
 

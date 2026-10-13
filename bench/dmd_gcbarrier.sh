@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build and run a D program with DMD's GC write barrier (-preview=gcbarrier) and oneday in card mode.
+# Build and run a D program with DMD's GC write barrier (-preview=gcbarrier) and steadygc in card mode.
 #
 #   DMD_REPO=<dmd checkout> PHOBOS=<phobos checkout> bench/dmd_gcbarrier.sh libs
 #   DMD_REPO=<dmd checkout> PHOBOS=<phobos checkout> bench/dmd_gcbarrier.sh build OUT FILE.d [extra dmd flags]

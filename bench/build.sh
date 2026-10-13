@@ -8,7 +8,7 @@
 #   SYMGC=DIR     the collector's source directory (default ../source)
 #   EXTRA="..."   extra compiler flags
 #
-# The same binary runs with druntime's GC (no option) and with oneday (--DRT-gcopt=gc:sdcq): see compare.sh.
+# The same binary runs with druntime's GC (no option) and with steadygc (--DRT-gcopt=gc:sdcq): see compare.sh.
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 DC=${DC:-dmd}

@@ -1,6 +1,6 @@
-# How oneday works
+# How steadygc works
 
-oneday is a fork of [symgc](https://github.com/symmetryinvestments/symgc) (the SDC garbage collector ported to
+steadygc is a fork of [symgc](https://github.com/symmetryinvestments/symgc) (the SDC garbage collector ported to
 ordinary D, by Steven Schveighoffer and Amaury Sachet). Its allocator comes from symgc unchanged. What the fork
 changes is *when* the program has to stop: the mark and the sweep run beside the program, and the only stops left
 are two short pauses per cycle.
@@ -99,7 +99,7 @@ at 2 GiB).
 While the mark runs, the program can store a pointer to an object the GC has not reached into an object the GC has
 already scanned, then drop the other path to it. Without help the GC would never see that object again and would
 free it while it is in use. Write tracking finds every memory region written during the mark so it can be scanned
-again. oneday has three ways, chosen once, at the first collection:
+again. steadygc has three ways, chosen once, at the first collection:
 
 | Mode | How it knows what was written | Needs | Cost to the program |
 |---|---|---|---|

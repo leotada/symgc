@@ -1,6 +1,6 @@
-# oneday: a low-latency garbage collector for D
+# steadygc: a low-latency garbage collector for D
 
-oneday is a fork of [symgc](https://github.com/symmetryinvestments/symgc), the SDC garbage collector ported to
+steadygc is a fork of [symgc](https://github.com/symmetryinvestments/symgc), the SDC garbage collector ported to
 ordinary D. It keeps symgc's allocator, which has no global lock, and moves the mark and the sweep beside the
 program. A game written the ordinary D way, with `new`, closures, `~=` and associative arrays and no pools, should not
 lose a frame to the collector.
@@ -24,9 +24,9 @@ under Linux 6.12, built with DMD 2.113:
 |---|---|---|---|
 | druntime's GC | 138 ms | 141 ms | 4 |
 | Upstream symgc | 24.7 ms | 28.0 ms | 3 |
-| oneday, stop-the-world mark | 10.3 ms | 11.1 ms | 0 |
-| oneday, concurrent mark (kernel tracker) | 1.1 ms | 1.3 ms | 0 |
-| oneday, LDC with the card barrier | 0.77 ms | 0.87 ms | 0 |
+| steadygc, stop-the-world mark | 10.3 ms | 11.1 ms | 0 |
+| steadygc, concurrent mark (kernel tracker) | 1.1 ms | 1.3 ms | 0 |
+| steadygc, LDC with the card barrier | 0.77 ms | 0.87 ms | 0 |
 | No collection at all (the game's own cost, DMD) | 0.97 ms | 0.98 ms | 0 |
 
 The rest, including game models with six job threads and 8 GiB heaps, is in `benchmarks.md`.

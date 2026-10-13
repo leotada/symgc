@@ -1,20 +1,20 @@
-# Helping test oneday
+# Helping test steadygc
 
 This is a preview. What it needs most is reports from programs and machines other than the one it was developed on:
 other operating systems, other CPUs, other compilers, and real games. This page says what to run and what to send.
 
 ## Try it on your own program
 
-The cheapest useful test: build your program once with oneday linked in (`integration.md`), then run the same binary
+The cheapest useful test: build your program once with steadygc linked in (`integration.md`), then run the same binary
 twice.
 
 ```sh
 ./mygame                          # druntime's GC
-./mygame --DRT-gcopt=gc:sdc       # oneday (prints "using SYM GC!")
+./mygame --DRT-gcopt=gc:sdc       # steadygc (prints "using SYM GC!")
 ```
 
 Compare what you care about: frame times (p50, p99, worst, frames over 16.7 ms), memory, load times. If your program
-has a test suite, run it under oneday too (`--DRT-gcopt=gc:sdcq`), and once with the collector built in verifier
+has a test suite, run it under steadygc too (`--DRT-gcopt=gc:sdcq`), and once with the collector built in verifier
 mode (`-version=Symgc_verify`), which catches use-after-free in the collector or in your program.
 
 ## The benchmark kit
@@ -29,7 +29,7 @@ The programs live in `plans/bench/core_bench/` of the dmd repository. They are w
 | `aaa_sim.d` | City builder, RTS and open world with 6 job threads and 2 GiB of assets | `city 60 2048 6 0 500000`, `rts 60 2048 6 0 100000`, `openworld 60 2048 6 0 100000` |
 | `gcb.d` | Allocation throughput and fragmentation | `alloc 1 8000000`, `alloc 8 4000000`, `frag 3000000 100000` |
 
-`dmd_bench.sh` builds all of them with DMD (druntime's GC, upstream symgc, oneday with and without the concurrent
+`dmd_bench.sh` builds all of them with DMD (druntime's GC, upstream symgc, steadygc with and without the concurrent
 mark) and with the card-barrier LDC, runs them, and writes one line per run to `results.txt`. Read it before running
 it: the paths at the top point at the build locations of the project.
 
@@ -78,7 +78,7 @@ Copy this, fill it in, and attach the full output of the runs:
 **Setup:** plugin / plugin + project druntime / card barrier
 **Flags:** compiler flags and --DRT-gcopt options; SYMGC_* environment variables
 **Program:** benchmark name and arguments, or your project (what it does, threads, live heap size)
-**Result:** the frame_p50_us line (or your own numbers) for druntime's GC and for oneday
+**Result:** the frame_p50_us line (or your own numbers) for druntime's GC and for steadygc
 **Problems:** crash output, backtrace (gdb/lldb `bt`), whether -version=Symgc_verify reports anything
 ```
 

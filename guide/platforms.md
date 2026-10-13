@@ -6,7 +6,7 @@ see `testing.md`.
 
 ## Compilers
 
-| Compiler | Frontend | Upstream symgc | oneday | Concurrent mark | Card barrier | Status |
+| Compiler | Frontend | Upstream symgc | steadygc | Concurrent mark | Card barrier | Status |
 |---|---|---|---|---|---|---|
 | DMD 2.109 and older | ≤ 2.109 | Does not build (no `ThreadBase.tlsGCData`) | Same | — | — | Checked |
 | LDC 1.40 | 2.110 | Does not build (same) | Same | — | — | Checked |
@@ -25,12 +25,12 @@ needs a release whose druntime is 2.112 or newer.
 
 **The druntime from this project** adds two things: the game-engine calls in `core.memory.GC` (`frameStats`,
 `excludeCurrentThread`, `step`, `defrag`, ...) and a 2-line fix that lets a collector stop the world from its own
-thread. oneday needs neither: without the calls it simply does not offer them, and without the fix its GC thread
+thread. steadygc needs neither: without the calls it simply does not offer them, and without the fix its GC thread
 poses as a placeholder thread while it scans (`core/thread/symthread.d`), which an unpatched druntime accepts.
 
 ## Operating systems
 
-| OS | Upstream symgc | oneday | Write tracking available | Known blockers |
+| OS | Upstream symgc | steadygc | Write tracking available | Known blockers |
 |---|---|---|---|---|
 | Linux x86-64 | Supported | Measured (every number in `benchmarks.md`) | Cards (patched LDC); kernel tracker on 6.7+ | None |
 | Linux arm64 | Tested upstream (4 KiB pages) | Compiles, with the card barrier (checked 2026-10-12). Never run | Cards (patched LDC); the kernel tracker is x86-64 only (`d/gc/dirty.d` hard-codes its syscall numbers) | Needs a machine or an emulator to run the battery |
