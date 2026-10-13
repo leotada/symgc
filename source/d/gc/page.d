@@ -214,8 +214,10 @@ public:
 
 	/**
 	 * Large allocation facilities.
+	 * Returns the Extent* so appendable setup can set capacity without a
+	 * second emap lookup of the pointer we just mapped.
 	 */
-	void* allocLarge(ref CachedExtentMap emap, uint pages, bool zero) shared {
+	Extent* allocLarge(ref CachedExtentMap emap, uint pages, bool zero) shared {
 		bool dirty;
 		auto e = allocPages(pages, dirty);
 		if (unlikely(e is null)) {
@@ -233,7 +235,7 @@ public:
 			pages_zero(e.address, e.size);
 		}
 
-		return e.address;
+		return e;
 	}
 
 	bool growLarge(ref CachedExtentMap emap, Extent* e, uint pages) shared {

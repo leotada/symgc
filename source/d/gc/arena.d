@@ -190,8 +190,9 @@ public:
 
 	/**
 	 * Large allocation facilities.
+	 * Returns the Extent* (see PageFiller.allocLarge).
 	 */
-	void* allocLarge(ref CachedExtentMap emap, uint pages, bool zero) shared {
+	Extent* allocLarge(ref CachedExtentMap emap, uint pages, bool zero) shared {
 		return filler.allocLarge(emap, pages, zero);
 	}
 

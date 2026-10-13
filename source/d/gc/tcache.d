@@ -323,6 +323,8 @@ public:
 
 		asize = max(asize, 2 * Quantum);
 		// Short format/appender: one qalloc covers a typical line.
+		// (Plain Appender/format use GC.qalloc without APPENDABLE — that path
+		// is floored in SnazzyGC.qalloc. This floor still helps new T[] NO_SCAN.)
 		if (finalizer is null && !containsPointers) {
 			asize = max(asize, 64);
 		}
@@ -331,18 +333,19 @@ public:
 		       "allocAppendable got size class without metadata support!");
 
 		if (isSmallSize(asize)) {
+			import d.gc.slab;
+			auto sc = getSizeClass(asize);
+			auto slotSize = binInfos[sc].slotSize;
 			auto ptr = allocSmall(asize, containsPointers, zero);
 			if (unlikely(ptr is null)) {
 				return null;
 			}
 
-			// Fresh slot: write metadata without probing hasMetadata (atomic load).
-			// Page-descriptor cache hits when many appendable allocs share a slab.
+			// Fresh slot: ptr is already the slot base; skip SlabEntry rebuild.
 			auto pd = getPageDescriptorCached(ptr);
-			auto se = SlabEntry(pd, ptr);
-			auto slotSize = binInfos[se.sizeClass].slotSize;
-			writeNewSlotMetadata(pd.extent, se.index, slotSize,
-			                     se.computeAddress(), finalizer, size);
+			auto index = binInfos[sc].computeIndex(pd.computeOffset(ptr));
+			writeNewSlotMetadata(pd.extent, index, slotSize, ptr, finalizer,
+			                     size);
 			// BlkAttr bits (core.memory): APPENDABLE=8, NO_SCAN=2, FINALIZE=1.
 			uint attr = 0b1000;
 			if (!containsPointers) {
@@ -356,13 +359,11 @@ public:
 		}
 
 		auto pages = getPageCount(capacity);
-		auto ptr = allocLarge(pages, containsPointers, zero);
-		if (unlikely(ptr is null)) {
+		auto e = allocLargeExtent(pages, containsPointers, zero);
+		if (unlikely(e is null)) {
 			return null;
 		}
 
-		auto pd = getPageDescriptor(ptr);
-		auto e = pd.extent;
 		e.setUsedCapacity(size);
 		e.setFinalizer(finalizer);
 		uint attr = 0b1000;
@@ -372,8 +373,8 @@ public:
 		if (finalizer !is null) {
 			attr |= 0b0001;
 		}
-		noteLastBlk(ptr, e.size, attr);
-		return ptr;
+		noteLastBlk(e.address, e.size, attr);
+		return e.address;
 	}
 
 	void free(void* ptr) {
@@ -918,6 +919,15 @@ private:
 	 * Large allocations.
 	 */
 	void* allocLarge(uint pages, bool containsPointers, bool zero) {
+		auto e = allocLargeExtent(pages, containsPointers, zero);
+		return e is null ? null : e.address;
+	}
+
+	/**
+	 * Same as allocLarge, but keeps the Extent* so appendable metadata can be
+	 * written without a second emap lookup.
+	 */
+	Extent* allocLargeExtent(uint pages, bool containsPointers, bool zero) {
 		assert(!isScanningThread, "Trying to allocate while in scanning thread!");
 		ensureThreadCacheIsInitialized();
 
@@ -928,24 +938,24 @@ private:
 		// We are about to allocate, make room for it if needed.
 		maybeRunGCCycle();
 
-		void* ptr;
+		Extent* e;
 
 		{
 			state.enterBusyState();
 			scope(exit) state.exitBusyState();
 
 			auto arena = chooseArena(containsPointers);
-			ptr = arena.allocLarge(emap, pages, zero);
+			e = arena.allocLarge(emap, pages, zero);
 		}
 
-		if (unlikely(ptr is null)) {
+		if (unlikely(e is null)) {
 			return null;
 		}
 
 		auto nbytes = pages * PageSize;
 		triggerAllocationEvent(nbytes);
-		noteLastBlk(ptr, nbytes, containsPointers ? 0 : 0b0010);
-		return ptr;
+		noteLastBlk(e.address, nbytes, containsPointers ? 0 : 0b0010);
+		return e;
 	}
 
 	void noteLastBlk(void* ptr, size_t blkSize, uint attr) nothrow {
