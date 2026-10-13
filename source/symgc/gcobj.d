@@ -82,6 +82,52 @@ private pragma(crt_constructor) void gc_sdc_ctor()
 	_d_register_sdc_gc();
 }
 
+// A druntime older than 2.112 (GDC 15 ships 2.111) has no thread-init hook in
+// registerGCFactory: it never tells the collector about the threads it creates, so
+// the first stop-the-world finds a druntime thread without a thread cache.
+// Such a druntime runs every module's thread-local constructor when a thread
+// starts, before its function, and the destructor when the function returns,
+// before the thread leaves druntime's list: the same two moments the hook has.
+enum druntimeCallsThreadHooks = __traits(compiles, {
+	import core.gc.registry;
+	registerGCFactory("sdc", &initialize, &initSDCThread);
+});
+
+static if (!druntimeCallsThreadHooks) version (Posix)
+{
+	// Set on the thread that created the process state (the one that ran initialize):
+	// it is registered already, and lives as long as the collector.
+	private bool processThread;
+
+	static this()
+	{
+		import core.thread : Thread;
+		import d.gc.tcache;
+
+		auto t = Thread.getThis();
+		if (t is null || t.tlsGCData !is null)
+			return;
+
+		if (processThread)
+			t.tlsGCData = &threadCache;
+		else
+			initSDCThread(t);
+	}
+
+	static ~this()
+	{
+		import core.thread : Thread;
+		import d.gc.tcache;
+
+		auto t = Thread.getThis();
+		if (t is null || processThread || t.tlsGCData !is &threadCache)
+			return;
+
+		import d.gc.thread;
+		(cast(void function() nothrow @nogc)&destroyThread)();
+	}
+}
+
 extern(C) void thread_setGCSignals(int suspendSignalNo, int resumeSignalNo) nothrow @nogc;
 
 extern(C) void _d_register_sdc_gc()
@@ -129,6 +175,8 @@ private GC initializeQuiet()
 		// now it is ok to initialize
 		import d.gc.thread;
 		createProcess();
+		static if (!druntimeCallsThreadHooks) version (Posix)
+			processThread = true;
 	}
 
 	// check the config to see if we should set the thread count for scanning.
