@@ -238,8 +238,22 @@ final class SnazzyGC : SnazzyBases
 	{
 		auto ptr = sdcAllocate(size, bits, false, ti);
 
-		if(!ptr)
+		if (!ptr)
 			return BlkInfo.init;
+
+		// Appender/format call qalloc then read bi.size. Re-walking the emap
+		// for a block this thread just made was the dominant cost on small
+		// NO_SCAN appendable allocs; serve BlkInfo from the thread cache.
+		import d.gc.tcache;
+		size_t blkSize;
+		uint attr;
+		if (threadCache.consumeLastBlk(ptr, blkSize, attr)) {
+			BlkInfo bi;
+			bi.base = ptr;
+			bi.size = blkSize;
+			bi.attr = attr;
+			return bi;
+		}
 
 		return __sd_gc_hook_fetch_alloc_info(ptr);
 	}
@@ -280,9 +294,10 @@ final class SnazzyGC : SnazzyBases
 	 */
 	size_t extend(void* p, size_t minsize, size_t maxsize, const TypeInfo ti) nothrow
 	{
-		// Our GC does not support this style of extend. Instead you should use
-		// the array functions. These will operate the same, but are safer.
-		return 0;
+		// Grow a large block in place when free pages follow (same idea as
+		// druntime). Small slabs already return full slot capacity from qalloc.
+		return (cast(size_t function(void*, size_t, size_t) nothrow)&extendLarge)(
+			p, minsize, maxsize);
 	}
 
 	/**
@@ -574,6 +589,41 @@ final class SnazzyGC : SnazzyBases
 }
 
 // HELPER FUNCTIONS
+
+size_t extendLarge(void* p, size_t minsize, size_t maxsize)
+{
+	if (p is null || minsize == 0 || minsize > maxsize) {
+		return 0;
+	}
+
+	import d.gc.capi;
+	import d.gc.tcache;
+	import d.gc.size;
+	auto pd = __sd_gc_maybe_get_page_descriptor(p);
+	auto e = pd.extent;
+	if (e is null || pd.isSlab() || p !is e.address) {
+		return 0;
+	}
+
+	auto oldPages = e.npages;
+	auto needPages = getPageCount(e.size + minsize);
+	auto wantPages = getPageCount(e.size + maxsize);
+	if (needPages <= oldPages) {
+		return e.size;
+	}
+
+	auto target = wantPages > needPages ? wantPages : needPages;
+	if (!threadCache.growLargeForExtend(pd, target)) {
+		if (target == needPages) {
+			return 0;
+		}
+		if (!threadCache.growLargeForExtend(pd, needPages)) {
+			return 0;
+		}
+	}
+
+	return e.size;
+}
 
 void* getContextPointer(uint bits, const TypeInfo ti) nothrow @nogc
 {
