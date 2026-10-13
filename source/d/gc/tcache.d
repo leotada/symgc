@@ -1328,6 +1328,25 @@ private:
 		return pd;
 	}
 
+	/**
+	 * Soft page-descriptor lookup with the same one-page cache. Used by
+	 * `GC.extend`, which must return 0 for unknown / slab pointers without
+	 * asserting.
+	 */
+	public auto maybeGetPageDescriptorCached(void* ptr) {
+		auto aptr = alignDown(ptr, PageSize);
+		if (likely(aptr is pdCachePage) && pdCachePD.extent !is null) {
+			return pdCachePD;
+		}
+
+		auto pd = maybeGetPageDescriptor(ptr);
+		if (pd.extent !is null) {
+			pdCachePage = aptr;
+			pdCachePD = pd;
+		}
+		return pd;
+	}
+
 	package auto maybeGetPageDescriptor(const void* ptr) {
 		auto aptr = alignDown(ptr, PageSize);
 		return emap.lookup(aptr);

@@ -236,6 +236,17 @@ final class SnazzyGC : SnazzyBases
 	 */
 	BlkInfo qalloc(size_t size, uint bits, const scope TypeInfo ti) nothrow
 	{
+		// Phobos Appender (std.format) calls qalloc with NO_SCAN only — never
+		// APPENDABLE — and starts at 8 bytes, then 8→16→32→64 with a failed
+		// GC.extend between each step. Floor plain small NO_SCAN requests so
+		// one slot covers a typical format line; bi.size reports the full slot.
+		enum qallocNoScanFloor = 64;
+		if (size > 0 && size < qallocNoScanFloor
+		    && (bits & BlkAttr.NO_SCAN) != 0
+		    && (bits & (BlkAttr.APPENDABLE | BlkAttr.FINALIZE)) == 0) {
+			size = qallocNoScanFloor;
+		}
+
 		auto ptr = sdcAllocate(size, bits, false, ti);
 
 		if (!ptr)
@@ -596,10 +607,11 @@ size_t extendLarge(void* p, size_t minsize, size_t maxsize)
 		return 0;
 	}
 
-	import d.gc.capi;
 	import d.gc.tcache;
 	import d.gc.size;
-	auto pd = __sd_gc_maybe_get_page_descriptor(p);
+	// Soft cached lookup: Appender's first growth tries GC.extend on a slab
+	// pointer; a pd-cache hit avoids an uncached radix-tree walk before the 0.
+	auto pd = threadCache.maybeGetPageDescriptorCached(p);
 	auto e = pd.extent;
 	if (e is null || pd.isSlab() || p !is e.address) {
 		return 0;
