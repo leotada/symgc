@@ -146,12 +146,15 @@ where noted. Frame time is work only.
 | `--worst` (after 0058) | 5.087 ms | 5.818 ms | **1.14×** | 10.784 / 10.963 | 0 / 0 |
 | `--openworld` (after 0058) | 0.527 ms | 0.591 ms | **1.12×** | 1.321 / 1.658 | 0 / 0 |
 | `--worst-safe` (after 0058) | 2.589 ms | 2.619 ms | ~1.01× | 5.564 / 6.981 | 0 / 0 |
+| `--worst` (after 0060) | 4.832 ms | 5.483 ms | **1.14×** | 9.671 / **8.490** | 0 / 0 |
+| `--openworld` (after 0060) | 0.481 ms | 0.534 ms | **1.11×** | 1.278 / **1.266** | 0 / 0 |
+| `--worst-safe` (after 0060) | 2.419 ms | 2.392 ms | **0.99×** | 5.348 / 6.556 | 0 / 0 |
 
 **0058** floors Phobos `Appender`/`format` `GC.qalloc(…, NO_SCAN)` (no `APPENDABLE`) to 64 bytes and
-caches soft `GC.extend` page-descriptor lookups. Mean acceptance (≤1.2×) is **met** on `--worst` and
-`--openworld` (medians of 5). Remaining: `--openworld` / `--worst-safe` worst frame still above
-same-session druntime (same shape as post-0056). bullet_hell_stress concurrent max ~2.5 ms, 0 over
-16 ms, RSS ~2.9 GB; `correctness.sh` OK.
+caches soft `GC.extend` page-descriptor lookups. **0060** skips redundant `SlabEntry`/emap work on
+`allocAppendable`. Mean acceptance (≤1.2×) is **met**; `--worst`/`--openworld` worst ≤ druntime in
+the 0060 session. Remaining: `--worst-safe` worst (~+1.2 ms). bullet_hell_stress concurrent max
+~1.5 ms, 0 over 16 ms, RSS ~2.9 GB; `correctness.sh` OK.
 
 ```sh
 DC=path/to/dmd bash bench/engine_gc_compare.sh
