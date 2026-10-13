@@ -143,10 +143,15 @@ where noted. Frame time is work only.
 | `--worst` (after 0056) | ~5.3–5.6 ms | ~6.5–7.1 ms | ~1.23–1.27× | often ≤ druntime | often 0 |
 | `--openworld` (after 0056) | ~0.53–0.59 ms | ~0.70–0.77 ms | ~1.3× | mixed | 0 |
 | `--worst-safe` (after 0056) | ~2.7 ms | ~2.7 ms | ~1.0× | ~7 ms both | 0 |
+| `--worst` (after 0058) | 5.087 ms | 5.818 ms | **1.14×** | 10.784 / 10.963 | 0 / 0 |
+| `--openworld` (after 0058) | 0.527 ms | 0.591 ms | **1.12×** | 1.321 / 1.658 | 0 / 0 |
+| `--worst-safe` (after 0058) | 2.589 ms | 2.619 ms | ~1.01× | 5.564 / 6.981 | 0 / 0 |
 
-Acceptance (mean ≤1.2× on `--worst` and `--openworld`) is **not** met yet on this machine. Mutator
-`format`/`qalloc` remains the mean gap; bullet_hell_stress concurrent worst ~2.1 ms, 0 over 16 ms,
-RSS ~2.9 GB (no regression vs the large-heap bar).
+**0058** floors Phobos `Appender`/`format` `GC.qalloc(…, NO_SCAN)` (no `APPENDABLE`) to 64 bytes and
+caches soft `GC.extend` page-descriptor lookups. Mean acceptance (≤1.2×) is **met** on `--worst` and
+`--openworld` (medians of 5). Remaining: `--openworld` / `--worst-safe` worst frame still above
+same-session druntime (same shape as post-0056). bullet_hell_stress concurrent max ~2.5 ms, 0 over
+16 ms, RSS ~2.9 GB; `correctness.sh` OK.
 
 ```sh
 DC=path/to/dmd bash bench/engine_gc_compare.sh
