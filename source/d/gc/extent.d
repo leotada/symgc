@@ -320,11 +320,13 @@ public:
 	}
 
 	void setHasFinalizers() {
-		gAnyFinalizers.store(1);
+		import symgc.intrinsics : unlikely, atomicOrUlong;
+		if (unlikely(gAnyFinalizers.load!(MemoryOrder.Relaxed)() == 0)) {
+			gAnyFinalizers.store!(MemoryOrder.Release)(1);
+		}
 
-		if (!hasFinalizers) {
-			import core.atomic : atomicOp;
-			atomicOp!"|="(*cast(shared(size_t)*) &_sweepTag, HasFinalizersBit);
+		if (unlikely(!hasFinalizers)) {
+			atomicOrUlong(cast(shared(ulong)*) &_sweepTag, HasFinalizersBit);
 		}
 	}
 
@@ -715,7 +717,10 @@ public:
 		assert(isLarge(), "Cannot set finalizer on a slab alloc!");
 
 		if (finalizer !is null) {
-			gAnyFinalizers.store(1);
+			import symgc.intrinsics : unlikely;
+			if (unlikely(gAnyFinalizers.load!(MemoryOrder.Relaxed)() == 0)) {
+				gAnyFinalizers.store!(MemoryOrder.Release)(1);
+			}
 		}
 
 		_metadata.largeData.finalizer = finalizer;

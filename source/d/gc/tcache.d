@@ -1034,12 +1034,10 @@ private:
 		assert(!isScanningThread, "Trying to allocate while in scanning thread!");
 		ensureThreadCacheIsInitialized();
 
-		import d.gc.gctime;
-		auto gcTimer = GcTimer.begin(GcTimeKind.Alloc);
-		scope(exit) gcTimer.end();
-
-		// We are about to allocate, make room for it if needed.
-		maybeRunGCCycle();
+		auto nbytes = pages * PageSize;
+		if (unlikely(allocated + nbytes >= nextGCRun) && enableGC && !state.busy) {
+			maybeRunGCCycleAt(allocated + nbytes);
+		}
 
 		Extent* e;
 
@@ -1055,7 +1053,6 @@ private:
 			return null;
 		}
 
-		auto nbytes = pages * PageSize;
 		triggerAllocationEvent(nbytes);
 		return e;
 	}
@@ -1251,7 +1248,11 @@ private:
 			return false;
 		}
 
-		nextGCRun = allocated + BlockSize;
+		return maybeRunGCCycleAt(allocated);
+	}
+
+	bool maybeRunGCCycleAt(size_t currentAllocated) {
+		nextGCRun = currentAllocated + BlockSize;
 
 		import d.gc.gctime;
 		auto gcTimer = GcTimer.begin(GcTimeKind.Collect);

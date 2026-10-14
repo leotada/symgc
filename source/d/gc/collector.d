@@ -1493,7 +1493,12 @@ private:
 			lastTargetAdjustment = now;
 		}
 
-		auto floorTarget = max(2 * lastCollectionInfo.usedPages, minHeapSize);
+		enum LargeLivePages = 64 * 1024 * 1024 / PageSize;
+		auto used = lastCollectionInfo.usedPages;
+		auto liveTarget = used <= LargeLivePages
+			? 2 * used
+			: 2 * LargeLivePages + (used - LargeLivePages) + ((used - LargeLivePages) >> 1) + ((used - LargeLivePages) >> 3);
+		auto floorTarget = max(liveTarget, minHeapSize);
 		while (now - lastTargetAdjustment >= interval) {
 			auto delta = nextTarget - lastCollectionInfo.usedPages;
 			delta -= delta >> lgTargetDecay;
@@ -1586,7 +1591,19 @@ private:
 
 		// We set the target at 2x the current heap size, or keep it elevated
 		// at min(tbaseline, tpeak) when live size drops after a peak.
-		auto target = max(2 * lastCollectionInfo.usedPages, min(tbaseline, tpeak));
+		// Once the live heap exceeds 64 MiB, blend smoothly down toward 1.625x
+		// so 512 MiB - 2 GiB heaps do not double RSS while small heaps keep 2x.
+		enum LargeLivePages = 64 * 1024 * 1024 / PageSize; // 16384 pages (64 MiB)
+		auto used = lastCollectionInfo.usedPages;
+		size_t liveTarget;
+		if (used <= LargeLivePages) {
+			liveTarget = 2 * used;
+		} else {
+			auto above = used - LargeLivePages;
+			auto scaledAbove = above + (above >> 1) + (above >> 3); // 1.625x above 64 MiB
+			liveTarget = 2 * LargeLivePages + scaledAbove;
+		}
+		auto target = max(liveTarget, min(tbaseline, tpeak));
 
 		// Clamp the target based on configuration.
 		target = max(target, minHeapSize);
