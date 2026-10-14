@@ -303,9 +303,12 @@ final class SnazzyGC : SnazzyBases
 		// GC.extend between each step. Floor plain small NO_SCAN requests so
 		// one slot covers a typical format line; bi.size reports the full slot.
 		enum qallocNoScanFloor = 64;
+		// Floor small NO_SCAN qalloc (Appender/format). APPENDABLE is allowed:
+		// the allocAppendable path no longer floors, so qalloc is the only
+		// place that keeps a typical format line in one slot. FINALIZE stays out.
 		if (size > 0 && size < qallocNoScanFloor
 		    && (bits & BlkAttr.NO_SCAN) != 0
-		    && (bits & (BlkAttr.APPENDABLE | BlkAttr.FINALIZE)) == 0) {
+		    && (bits & BlkAttr.FINALIZE) == 0) {
 			size = qallocNoScanFloor;
 		}
 
@@ -846,8 +849,7 @@ void[] hook_getAllocationSlice(const void* ptr) {
 pragma(mangle, "__sd_gc_hook_shrink_array_used")
 bool hook_shrinkArrayUsed(void* ptr, size_t newUsed, size_t existingUsed) {
 	assert(newUsed <= existingUsed);
-	import d.gc.capi;
-	auto pd = __sd_gc_maybe_get_page_descriptor(ptr);
+	auto pd = threadCache.maybeGetPageDescriptorCached(ptr);
 	auto e = pd.extent;
 	if (e is null) {
 		return false;

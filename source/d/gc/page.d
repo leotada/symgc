@@ -1799,13 +1799,12 @@ private:
 		/**
 		 * Clear the metadata of the elements we collected. This is atomic,
 		 * because mutators clear and set flags of other slots of the same
-		 * slab while we sweep it.
+		 * slab while we sweep it. One word RMW instead of up to 64 bit clears.
 		 */
 		auto toClear = evicted & metadataFlags;
-		while (toClear != 0) {
-			auto index = countTrailingZeros(toClear);
-			e.slabMetadataFlags.clearBitAtomic(cast(uint) (nimbleIndex * 64 + index));
-			toClear &= (toClear - 1);
+		if (toClear != 0) {
+			atomicFetchOp!"&"(e.slabMetadataFlags.rawContent[nimbleIndex],
+			                  ~toClear);
 		}
 	}
 
@@ -1842,12 +1841,19 @@ private:
 		 * `evicted` either way.
 		 */
 		ulong[8] evicted;
+		ulong occupancyPreview = 0;
 		foreach (j; 0 .. nimble) {
 			evicted[j] = e.slabData.rawContent[j] & ~marks[j];
+			occupancyPreview |= e.slabData.rawContent[j] & ~evicted[j];
 		}
 
+		// Empty slab with no finalizers: metadata dies with the extent; skip
+		// per-nimble atomic flag clears.
+		const skipFinalize = supportsMetadata && !e.hasFinalizers
+			&& occupancyPreview == 0;
+
 		foreach (j; 0 .. nimble) {
-			if (supportsMetadata) {
+			if (supportsMetadata && !skipFinalize) {
 				finalizeSlabNimble(evicted[j], e.slabMetadataFlags.rawContent[j], sc, e, j);
 			}
 

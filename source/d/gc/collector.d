@@ -295,7 +295,13 @@ struct Collector {
 
 		CollectionInfo info;
 		runGCCycleLocked(info, false);
-		(cast(CollectorState*) &gCollectorState).recordProfile(info);
+		auto state = cast(CollectorState*) &gCollectorState;
+		state.lastCollectionInfo = info;
+		state.recordProfile(info);
+		// Explicit GC.collect must refresh the heap target; otherwise paced
+		// benches that collect+minimize before the run leave a stale nextTarget
+		// that decays below minHeapSize on the first needCollection check.
+		state.updateTargetPageCount();
 	}
 
 	/**
@@ -1463,6 +1469,11 @@ private:
 	bool needCollection() {
 		auto now = getMonotonicTime();
 		auto interval = max(amortizedDuration, 100 * Millisecond);
+
+		// First check: do not decay from epoch 0 across the whole uptime.
+		if (lastTargetAdjustment == 0) {
+			lastTargetAdjustment = now;
+		}
 
 		while (now - lastTargetAdjustment >= interval) {
 			auto delta = nextTarget - lastCollectionInfo.usedPages;
