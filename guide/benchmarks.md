@@ -290,6 +290,12 @@ the 0056 floor inside `allocAppendable` never applied to `std.format`. 0058 floo
 druntime; `--worst-safe` worst still ~+1.2 ms. bullet_hell concurrent max ~1.5 ms, 0 over 16 ms,
 RSS ~2.9 GB. `correctness.sh` OK.
 
+**0062:** per-bin pd cache for appendable size-class churn; remove `allocAppendable` 64B floor
+(keep qalloc floor); 2-way slab + large-extent append caches; `GC.collect` refreshes heap target;
+word-level slab metadata clear on sweep. After 0062: `--worst` **1.14×**, `--openworld` **1.17×**,
+`--worst-safe` mean **0.99×** / p99 **better than druntime**, worst still ~+1.1 ms. bullet_hell
+max **1.5 ms**, 0 over 16 ms, RSS ~2.9 GB. `correctness.sh` OK.
+
 ### Phase 2 falsification numbers
 
 | Experiment | Result |
