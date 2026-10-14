@@ -155,6 +155,9 @@ where noted. Frame time is work only.
 | `--worst` (after 0064) | 4.806 ms | 4.898 ms | **1.02×** | 9.449 / **7.616** | 0 / 0 |
 | `--openworld` (after 0064) | 0.502 ms | 0.505 ms | **1.01×** | 1.366 / 1.426 | 0 / 0 |
 | `--worst-safe` (after 0064) | 2.487 ms | 2.471 ms | **0.99×** | 5.418 / 6.293 | 0 / 0 |
+| `--worst` (after 0066) | 5.014 ms | 5.072 ms | **1.01×** | 10.398 / **7.965** | 0 / 0 |
+| `--openworld` (after 0066) | 0.515 ms | 0.504 ms | **0.98×** | 1.278 / **1.223** | 0 / 0 |
+| `--worst-safe` (after 0066) | 2.545 ms | 2.508 ms | **0.99×** | 5.695 / 6.603 | 0 / 0 |
 
 **0058** floors Phobos `Appender`/`format` `GC.qalloc(…, NO_SCAN)` (no `APPENDABLE`) to 64 bytes and
 caches soft `GC.extend` page-descriptor lookups. **0060** skips redundant `SlabEntry`/emap work on
@@ -167,7 +170,10 @@ fixes `lastRecycleTime` update in `recycleBins()`, skips redundant `reassociateA
 returns `BlkInfo` directly in `qalloc`, and makes `SnazzyGC.frameStats()` lock-free.
 `steadygc` now matches `druntime` within **1–2%** on mean across `--worst`, `--openworld`, and `--worst-safe`,
 while beating `druntime` on `--worst` p99 (**6.618 ms** vs **9.150 ms**), worst frame (**7.616 ms** vs **9.449 ms**),
-and user CPU (**3.97 s** vs **4.51 s**).
+and user CPU (**3.97 s** vs **4.51 s**). **0066** eliminates unconditional global `gAnyFinalizers` `xchg` writes on every
+finalized allocation (`Extent.setHasFinalizers` and `Extent.setFinalizer`), skips two `clock_gettime` calls on the
+`allocLargeExtent` fast path, and blends the heap collection target above 64 MiB live to `1.625×` (cutting peak RSS on
+500 MiB–2 GiB heaps below `druntime` on `gcb frag`, `gcb frames 512`, `bullet_hell_stress`, and `entity_init`).
 
 ```sh
 DC=path/to/dmd bash bench/engine_gc_compare.sh

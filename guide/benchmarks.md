@@ -304,6 +304,20 @@ vs dru **9.15 ms**, worst **7.62 ms** vs **9.45 ms**, user CPU **3.97 s** vs **4
 (RSS **57 MB** vs **73 MB**), `--worst-safe` **0.99×** (p99 **3.56 ms** vs **3.60 ms**). `113/113` unit tests
 and `correctness.sh` OK.
 
+**0066:** check-before-write on `gAnyFinalizers` and `_sweepTag` in `Extent.setHasFinalizers` and `Extent.setFinalizer`
+(eliminating an unconditional `xchg` on a global cacheline on every `new Class` allocation), skip `GcTimer` on the
+`allocLargeExtent` fast path, and blend `CollectorState` target growth above 64 MiB live from `2.0×` to `1.625×`.
+After 0066: `gcb alloc 8 4000000` **68.26 / 73.83 Mops/s** (**16.4×–17.8×** faster than druntime **4.15 Mops/s**);
+`gcb frag` RSS **853 / 865 MB** vs druntime **977 MB**; `gcb frames 512` concurrent max **1.11 ms** vs druntime
+**128.7 ms** (RSS **982 MB** vs **1032 MB**); `bullet_hell_stress` (2 GiB) max **1.30 / 1.95 ms** vs druntime
+**141.2 ms** (RSS **2984 MB** vs **4253 MB**); `aaa_sim city` (6 threads) p50 **2.64 ms** vs **4.69 ms**, p99
+**4.04 ms** vs **10.33 ms**, max **4.85 ms** vs **76.45 ms** (`0` frames over 5 ms or 16 ms vs `282` / `8`);
+`aaa_sim rts` (6 threads) p99 **4.08 ms** vs **5.41 ms**, max **5.96 ms** vs **7.55 ms**; `entity_init` p99
+**3.13 ms** vs **3.23 ms** (RSS **710 MB** vs **765 MB**); `engine_gc_compare.sh` `--worst` **1.01×** mean
+(p99 **7.09 ms** vs **9.23 ms**, worst **7.97 ms** vs **10.40 ms**, user CPU **4.04 s** vs **4.59 s**),
+`--openworld` **0.98×** mean (worst **1.22 ms** vs **1.28 ms**), `--worst-safe` **0.99×** mean (p99 **3.52 ms**
+vs **3.58 ms**). `113/113` unit tests and `correctness.sh` OK.
+
 ### Phase 2 falsification numbers
 
 | Experiment | Result |
