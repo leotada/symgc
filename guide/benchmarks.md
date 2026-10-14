@@ -296,6 +296,14 @@ word-level slab metadata clear on sweep. After 0062: `--worst` **1.14×**, `--op
 `--worst-safe` mean **0.99×** / p99 **better than druntime**, worst still ~+1.1 ms. bullet_hell
 max **1.5 ms**, 0 over 16 ms, RSS ~2.9 GB. `correctness.sh` OK.
 
+**0064:** x86-64 `SeqCst` load as plain `mov` (acquire), inline `lock or`/`lock and`, compile-time `RTree`
+`subKey!level` + release/acquire leaf ops, false-root elimination in `ThreadBin`/`ThreadCache`, per-bin
+multi-page slab extent cache, `lastRecycleTime = now` fix in `recycleBins()`, `reassociateArena()` fast return,
+direct `qalloc` `BlkInfo` output, and lock-free `frameStats()`. After 0064: `--worst` **1.02×** (p99 **6.62 ms**
+vs dru **9.15 ms**, worst **7.62 ms** vs **9.45 ms**, user CPU **3.97 s** vs **4.51 s**), `--openworld` **1.01×**
+(RSS **57 MB** vs **73 MB**), `--worst-safe` **0.99×** (p99 **3.56 ms** vs **3.60 ms**). `113/113` unit tests
+and `correctness.sh` OK.
+
 ### Phase 2 falsification numbers
 
 | Experiment | Result |

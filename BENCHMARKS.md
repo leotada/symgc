@@ -152,15 +152,22 @@ where noted. Frame time is work only.
 | `--worst` (after 0062) | 4.864 ms | 5.524 ms | **1.14×** | 9.607 / **8.758** | 0 / 0 |
 | `--openworld` (after 0062) | 0.484 ms | 0.565 ms | **1.17×** | 1.260 / **1.256** | 0 / 0 |
 | `--worst-safe` (after 0062) | 2.456 ms | 2.438 ms | **0.99×** | 5.421 / 6.556 | 0 / 0 |
+| `--worst` (after 0064) | 4.806 ms | 4.898 ms | **1.02×** | 9.449 / **7.616** | 0 / 0 |
+| `--openworld` (after 0064) | 0.502 ms | 0.505 ms | **1.01×** | 1.366 / 1.426 | 0 / 0 |
+| `--worst-safe` (after 0064) | 2.487 ms | 2.471 ms | **0.99×** | 5.418 / 6.293 | 0 / 0 |
 
 **0058** floors Phobos `Appender`/`format` `GC.qalloc(…, NO_SCAN)` (no `APPENDABLE`) to 64 bytes and
 caches soft `GC.extend` page-descriptor lookups. **0060** skips redundant `SlabEntry`/emap work on
 `allocAppendable`. **0062** adds a per-bin page-descriptor cache, drops the redundant 64B floor from
 `allocAppendable` (qalloc keeps it), a 2-way slab append cache plus a large-extent append cache,
 fixes explicit `GC.collect` target refresh / epoch-0 decay, and word-clears slab metadata flags on
-sweep. Mean acceptance (≤1.2×) still **met**; `--worst-safe` p99 improved (3.15 vs dru 3.36); Frame 0
-worst still ~+1.1 ms. bullet_hell_stress concurrent max **1.5 ms**, 0 over 16 ms, RSS ~2.9 GB;
-`correctness.sh` OK.
+sweep. **0064** lowers `SeqCst` atomic loads on x86-64 to plain `mov` (acquire), adds inline `lock or`/`lock and`
+and `RTree` release/acquire L1 lookup, eliminates false conservative roots in `ThreadBin`/`ThreadCache`,
+fixes `lastRecycleTime` update in `recycleBins()`, skips redundant `reassociateArena()` under `busyState`,
+returns `BlkInfo` directly in `qalloc`, and makes `SnazzyGC.frameStats()` lock-free.
+`steadygc` now matches `druntime` within **1–2%** on mean across `--worst`, `--openworld`, and `--worst-safe`,
+while beating `druntime` on `--worst` p99 (**6.618 ms** vs **9.150 ms**), worst frame (**7.616 ms** vs **9.449 ms**),
+and user CPU (**3.97 s** vs **4.51 s**).
 
 ```sh
 DC=path/to/dmd bash bench/engine_gc_compare.sh
