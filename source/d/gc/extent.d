@@ -484,13 +484,27 @@ public:
 			enum NimbleSize = 8 * ulong.sizeof;
 			auto shift = n * NimbleSize;
 
+			if (current == ulong.max) {
+				uint count = min(64U, nfill);
+				current = (count == 64) ? 0UL : (ulong.max << count);
+				void* p = address + shift * slotSize;
+				foreach (_; 0 .. count) {
+					*(insert++) = p;
+					p += slotSize;
+				}
+
+				slabData.rawContent[n] = ~current;
+				nfill -= count;
+				continue;
+			}
+
 			import symgc.intrinsics;
 			uint count = popCount(current);
 			count = min(count, nfill);
 
 			foreach (_; 0 .. count) {
 				auto bit = countTrailingZeros(current);
-				current ^= 1UL << bit;
+				current &= current - 1;
 
 				auto slot = shift + bit;
 				*(insert++) = address + slot * slotSize;
@@ -517,6 +531,7 @@ public:
 	/**
 	 * Metadata features for slabs.
 	 */
+	pragma(inline, true)
 	@property
 	ref Bitmap!512 slabData() {
 		// FIXME: in contract.
@@ -525,6 +540,7 @@ public:
 		return _metadata.slabData.slabData;
 	}
 
+	pragma(inline, true)
 	@property
 	ref shared(Bitmap!256) slabMetadataFlags() {
 		assert(extentClass.supportsMetadata,
@@ -533,6 +549,7 @@ public:
 		return _metadata.slabData.slabMetadata.flags;
 	}
 
+	pragma(inline, true)
 	bool hasMetadata(uint index) {
 		assert(extentClass.supportsMetadata,
 		       "size class not supports slab metadata!");
@@ -541,22 +558,25 @@ public:
 		return slabMetadataFlags.valueAtAtomic(index);
 	}
 
+	pragma(inline, true)
 	void enableMetadata(uint index) {
 		assert(extentClass.supportsMetadata,
 		       "size class not supports slab metadata!");
 		assert(index < nslots, "index is out of range!");
 
-		slabMetadataFlags.setBitAtomic(index);
+		slabMetadataFlags.setBitAtomicNoRet(index);
 	}
 
+	pragma(inline, true)
 	void disableMetadata(uint index) {
 		assert(extentClass.supportsMetadata,
 		       "size class not supports slab metadata!");
 		assert(index < nslots, "index is out of range!");
 
-		slabMetadataFlags.clearBitAtomic(index);
+		slabMetadataFlags.clearBitAtomicNoRet(index);
 	}
 
+	pragma(inline, true)
 	@property
 	ref shared(Bitmap!128) slabMetadataMarks() {
 		assert(extentClass.dense, "size class not dense!");
@@ -566,6 +586,7 @@ public:
 		return _metadata.slabData.slabMetadata.marks;
 	}
 
+	pragma(inline, true)
 	@property
 	ref ulong* outlineMarksBuffer() {
 		assert(extentClass.dense, "size class not dense!");
@@ -575,6 +596,7 @@ public:
 		return _gcMetadata.outlineBuffer;
 	}
 
+	pragma(inline, true)
 	@property
 	ref shared(Bitmap!512) outlineMarks() {
 		assert(extentClass.dense, "size class not dense!");
@@ -584,6 +606,7 @@ public:
 		return *_gcMetadata.outlineBitmap;
 	}
 
+	pragma(inline, true)
 	bool markSparseSlot(ubyte gcCycle, uint index) {
 		assert(extentClass.sparse, "size class not sparse!");
 		assert(!isLarge(), "size class large!");
@@ -604,6 +627,7 @@ public:
 		return (old & bit) == 0;
 	}
 
+	pragma(inline, true)
 	bool markLarge(ubyte gcCycle) {
 		assert(isLarge(), "size class not large!");
 		auto old = gcWord.load();
@@ -618,6 +642,7 @@ public:
 		}
 	}
 
+	pragma(inline, true)
 	bool markDenseSlot(uint index) {
 		assert(extentClass.dense, "size class not dense!");
 		if (extentClass.supportsInlineMarking) {

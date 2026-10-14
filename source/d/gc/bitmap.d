@@ -15,11 +15,13 @@ private:
 	ulong[NimbleCount] bits;
 
 public:
+	pragma(inline, true)
 	@property
 	ref ulong[NimbleCount] rawContent() const {
 		return bits;
 	}
 
+	pragma(inline, true)
 	@property
 	ref shared(ulong[NimbleCount]) rawContent() shared {
 		return bits;
@@ -31,6 +33,7 @@ public:
 		}
 	}
 
+	pragma(inline, true)
 	bool valueAt(uint index) const {
 		// FIXME: in contracts.
 		assert(index < N);
@@ -42,6 +45,7 @@ public:
 		return (n & 0x01) != 0;
 	}
 
+	pragma(inline, true)
 	bool valueAtAtomic(uint index) shared {
 		// FIXME: in contracts.
 		assert(index < N);
@@ -170,14 +174,17 @@ public:
 		return true;
 	}
 
+	pragma(inline, true)
 	void setBit(uint index) {
 		setBitValue!true(index);
 	}
 
+	pragma(inline, true)
 	void clearBit(uint index) {
 		setBitValue!false(index);
 	}
 
+	pragma(inline, true)
 	void setBitValue(bool V)(uint index) {
 		// FIXME: in contracts.
 		assert(index < N);
@@ -193,14 +200,37 @@ public:
 		}
 	}
 
+	pragma(inline, true)
 	bool setBitAtomic(uint index) shared {
 		return setBitValueAtomic!true(index);
 	}
 
+	pragma(inline, true)
 	bool clearBitAtomic(uint index) shared {
 		return setBitValueAtomic!false(index);
 	}
 
+	pragma(inline, true)
+	void setBitAtomicNoRet(uint index) shared {
+		assert(index < N);
+		auto i = index / NimbleSize;
+		auto b = ulong(1) << (index % NimbleSize);
+		if ((bits[i] & b) == 0) {
+			atomicOrUlong(&bits[i], b);
+		}
+	}
+
+	pragma(inline, true)
+	void clearBitAtomicNoRet(uint index) shared {
+		assert(index < N);
+		auto i = index / NimbleSize;
+		auto b = ulong(1) << (index % NimbleSize);
+		if ((bits[i] & b) != 0) {
+			atomicAndUlong(&bits[i], ~b);
+		}
+	}
+
+	pragma(inline, true)
 	bool setBitValueAtomic(bool V)(uint index) shared {
 		// FIXME: in contracts.
 		assert(index < N);

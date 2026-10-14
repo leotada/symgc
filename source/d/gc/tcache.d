@@ -41,8 +41,10 @@ private:
 	 * as no slab was freed anywhere since: `appendEpoch` is `gSlabFreeEpoch`.
 	 */
 	enum AppendCacheCount = 2;
-	const(void)*[AppendCacheCount] appendBase;
-	const(void)*[AppendCacheCount] appendEnd;
+	// Heap-pointing cache tags are stored bitwise-inverted (~cast(size_t) ptr)
+	// so conservative TLS root scanning ignores them.
+	size_t[AppendCacheCount] appendBaseInv;
+	size_t[AppendCacheCount] appendEndInv;
 	import d.gc.extent : Extent;
 	Extent*[AppendCacheCount] appendExtent;
 	uint[AppendCacheCount] appendIndex;
@@ -52,33 +54,37 @@ private:
 
 	/**
 	 * Last page looked up for soft lookups (`GC.extend`, shrink). One entry is
-	 * enough there; appendable allocs that cycle size classes use binPdCache.
+	 * enough there; appendable allocs that cycle size classes use binExtentCache.
 	 */
 	PageDescriptor pdCachePD;
-	void* pdCachePage;
+	size_t pdCachePageInv;
 
 	/**
-	 * Per-bin page-descriptor cache for appendable small allocs. Paced engine
-	 * frames cycle size classes every NPC; a single pdCachePage misses ~100%.
-	 * Indexed by getBinIndex(sc, containsPointers); cleared in flush().
+	 * Per-bin slab-extent cache for appendable small allocs. Paced engine
+	 * frames cycle size classes every NPC and multi-page slabs (npages = 2..7)
+	 * cross 4 KB page boundaries every few slots; caching the slab Extent*,
+	 * inverted base address, and slab byte span hits across the entire slab.
 	 */
-	PageDescriptor[ThreadBinCount] binPdCache;
-	void*[ThreadBinCount] binPageCache;
+	Extent*[ThreadBinCount] binExtentCache;
+	size_t[ThreadBinCount] binBaseInvCache;
+	uint[ThreadBinCount] binSlabBytesCache;
 
 	/**
-	 * Last large appendable extent this thread grew with `~=`. StringTable and
-	 * similar grow past MaxSmallSize and would otherwise emap-lookup every append.
+	 * Last two large appendable extents this thread grew with `~=`. StringTable
+	 * alternates `storage ~= s` and `offsets ~= ...` past MaxSmallSize and
+	 * would otherwise emap-lookup every append.
 	 */
-	const(void)* appendLargeBase;
-	Extent* appendLargeExtent;
-	uint appendLargePages;
+	size_t[AppendCacheCount] appendLargeBaseInv;
+	Extent*[AppendCacheCount] appendLargeExtent;
+	uint[AppendCacheCount] appendLargePages;
+	ubyte appendLargeCacheNext;
 
 	/**
 	 * BlkInfo for the allocation this thread just made. `GC.qalloc` (Appender,
 	 * format) re-queries the block; the emap + metadata bit dominate that path
 	 * on small heaps. Valid only until the next alloc/free on this thread.
 	 */
-	void* lastBlkPtr;
+	size_t lastBlkPtrInv;
 	size_t lastBlkSize;
 	uint lastBlkAttr;
 
@@ -318,21 +324,25 @@ public:
 		flush();
 	}
 
-	void* alloc(size_t size, bool containsPointers, bool zero) {
+	pragma(inline, true)
+	void* alloc(size_t size, bool containsPointers, bool zero,
+	            size_t* outSize = null, uint* outAttr = null) {
 		if (!isAllocatableSize(size)) {
 			return null;
 		}
 
 		if (isSmallSize(size)) {
-			return allocSmall(size, containsPointers, zero);
+			return allocSmall(size, containsPointers, zero, outSize, outAttr);
 		}
 
 		auto pages = getPageCount(size);
-		return allocLarge(pages, containsPointers, zero);
+		return allocLarge(pages, containsPointers, zero, outSize, outAttr);
 	}
 
+	pragma(inline, true)
 	void* allocAppendable(size_t size, bool containsPointers, bool zero,
-	                      Finalizer finalizer = null, size_t capacity = 0) {
+	                      Finalizer finalizer = null, size_t capacity = 0,
+	                      size_t* outSize = null, uint* outAttr = null) {
 		// Reserve bytes for the finalizer if needed.
 		capacity = max(capacity, size);
 		auto asize = capacity + (finalizer !is null) * PointerSize;
@@ -342,7 +352,7 @@ public:
 
 		asize = max(asize, 2 * Quantum);
 		// No 64B floor here: SnazzyGC.qalloc floors Appender/format; per-bin
-		// pd cache absorbs size-class churn; short .idup keeps a tight slot.
+		// slab cache absorbs size-class churn; short .idup keeps a tight slot.
 
 		assert(sizeClassSupportsMetadata(getSizeClass(asize)),
 		       "allocAppendable got size class without metadata support!");
@@ -357,13 +367,17 @@ public:
 				return null;
 			}
 
-			// Fresh slot: ptr is the slot base; per-bin pd cache hits when
-			// successive allocs of this size class share a slab page.
+			// Fresh slot: ptr is the slot base; per-bin slab cache hits across
+			// all pages of a single- or multi-page slab.
 			auto binIndex = getBinIndex(sc, containsPointers);
-			auto pd = getBinPageDescriptorCached(binIndex, ptr);
-			auto index = binInfos[sc].computeIndex(pd.computeOffset(ptr));
-			writeNewSlotMetadata(pd.extent, index, slotSize, ptr, finalizer,
-			                     size);
+			auto e = binExtentCache[binIndex];
+			size_t offset = (cast(size_t) ptr) - (~binBaseInvCache[binIndex]);
+			if (unlikely(e is null || offset >= binSlabBytesCache[binIndex])) {
+				e = cacheBinSlabExtent(binIndex, sc, ptr);
+				offset = (cast(size_t) ptr) - (~binBaseInvCache[binIndex]);
+			}
+			auto index = binInfos[sc].computeIndex(offset);
+			writeNewSlotMetadata(e, index, slotSize, ptr, finalizer, size);
 			// BlkAttr bits (core.memory): APPENDABLE=8, NO_SCAN=2, FINALIZE=1.
 			uint attr = 0b1000;
 			if (!containsPointers) {
@@ -372,7 +386,11 @@ public:
 			if (finalizer !is null) {
 				attr |= 0b0001;
 			}
-			noteLastBlk(ptr, slotSize - (finalizer !is null ? PointerSize : 0), attr);
+			auto blkSize = slotSize - (finalizer !is null ? PointerSize : 0);
+			if (outSize !is null) {
+				*outSize = blkSize;
+				*outAttr = attr;
+			}
 			return ptr;
 		}
 
@@ -391,7 +409,10 @@ public:
 		if (finalizer !is null) {
 			attr |= 0b0001;
 		}
-		noteLastBlk(e.address, e.size, attr);
+		if (outSize !is null) {
+			*outSize = e.size;
+			*outAttr = attr;
+		}
 		return e.address;
 	}
 
@@ -664,8 +685,9 @@ public:
 				// A plain block has no used capacity to update, and must not
 				// become appendable (GC.getAttr would tell).
 				bool isAppendCached = false;
-				foreach (b; appendBase[]) {
-					if (ptr is b) {
+				auto ptrInv = ~cast(size_t) ptr;
+				foreach (bInv; appendBaseInv[]) {
+					if (ptrInv == bInv) {
 						isAppendCached = true;
 						break;
 					}
@@ -681,11 +703,7 @@ public:
 			}
 
 			if (newSizeClass > oldSizeClass) {
-				// Appendable: copy only the used prefix so we do not overwrite
-				// the new slot's metadata with the old slot's trailer.
-				copySize = appendable
-					? min(size, oldUsedCapacity)
-					: getSizeFromClass(oldSizeClass);
+				copySize = getSizeFromClass(oldSizeClass);
 			}
 		} else {
 			auto e = pd.extent;
@@ -694,7 +712,7 @@ public:
 				auto npages = getPageCount(size);
 
 				if (epages < npages) {
-					if (!growLarge(pd, npages)) {
+					if (!growLarge(e, npages)) {
 						goto LargeResizeFailed;
 					}
 
@@ -722,12 +740,7 @@ public:
 			copySize = min(size, e.usedCapacity);
 		}
 
-		// Keep APPENDABLE / finalizer on the new block. Plain alloc() left
-		// small appendable growth without metadata, so later ~= paid a fresh
-		// allocation every time (format/appender hot path on small heaps).
-		void* newPtr = appendable
-			? allocAppendable(size, containsPointers, false, oldFinalizer)
-			: alloc(size, containsPointers, false);
+		void* newPtr = alloc(size, containsPointers, false);
 		if (newPtr is null) {
 			return null;
 		}
@@ -747,10 +760,15 @@ public:
 			b.fullFlush(emap);
 		}
 
-		pdCachePage = null;
+		pdCachePageInv = 0;
 		pdCachePD = PageDescriptor.init;
-		binPageCache[] = null;
-		binPdCache[] = PageDescriptor.init;
+		binExtentCache[] = null;
+		binBaseInvCache[] = 0;
+		binSlabBytesCache[] = 0;
+		appendBaseInv[] = 0;
+		appendEndInv[] = 0;
+		appendExtent[] = null;
+		lastBlkPtrInv = 0;
 		clearAppendLargeCache();
 	}
 
@@ -758,25 +776,32 @@ private:
 	/**
 	 * Small allocations.
 	 */
-	void* allocSmall(size_t size, bool containsPointers, bool zero) {
+	pragma(inline, true)
+	void* allocSmall(size_t size, bool containsPointers, bool zero,
+	                 size_t* outSize = null, uint* outAttr = null) {
 		// TODO: in contracts
 		assert(isSmallSize(size));
 
 		import d.gc.slab;
 		auto sizeClass = getSizeClass(size);
-		return allocSmallInClass(sizeClass, containsPointers, zero, size);
+		return allocSmallInClass(sizeClass, containsPointers, zero, size,
+		                         outSize, outAttr);
 	}
 
+	pragma(inline, true)
 	void* allocSmallInClass(ubyte sizeClass, bool containsPointers, bool zero,
-	                        size_t clearSize = size_t.max) {
+	                        size_t clearSize = size_t.max,
+	                        size_t* outSize = null, uint* outAttr = null) {
 		auto ptr = allocSmallSlot(sizeClass, containsPointers, zero, clearSize);
 		if (unlikely(ptr is null)) {
 			return null;
 		}
 
-		import d.gc.slab;
-		auto slotSize = binInfos[sizeClass].slotSize;
-		noteLastBlk(ptr, slotSize, containsPointers ? 0 : 0b0010);
+		if (outSize !is null) {
+			import d.gc.slab;
+			*outSize = binInfos[sizeClass].slotSize;
+			*outAttr = containsPointers ? 0 : 0b0010;
+		}
 		return ptr;
 	}
 
@@ -784,6 +809,7 @@ private:
 	 * Small alloc for appendable: same as allocSmallInClass but leaves BlkInfo
 	 * recording to the caller (which sets APPENDABLE / FINALIZE bits once).
 	 */
+	pragma(inline, true)
 	void* allocSmallForAppendable(ubyte sizeClass, uint slotSize,
 	                              bool containsPointers, bool zero,
 	                              size_t clearSize) {
@@ -791,6 +817,7 @@ private:
 		return allocSmallSlot(sizeClass, containsPointers, zero, clearSize);
 	}
 
+	pragma(inline, true)
 	void* allocSmallSlot(ubyte sizeClass, bool containsPointers, bool zero,
 	                     size_t clearSize) {
 		import d.gc.slab;
@@ -824,22 +851,35 @@ private:
 		return ptr;
 	}
 
-	static uint getBinIndex(ubyte sizeClass, bool containsPointers) {
+	pragma(inline, true)
+	static uint getBinIndex(ubyte sizeClass, bool containsPointers) nothrow @nogc {
 		return 2 * sizeClass | containsPointers;
 	}
 
+	pragma(inline, true)
 	void* allocSmallBin(ubyte sizeClass, uint slotSize, bool containsPointers,
 	                    ref bool wasZeroed) {
 		assert(slotSize == binInfos[sizeClass].slotSize, "Invalid slot size!");
 		assert(!isScanningThread, "Trying to free while in scanning thread!");
 
-		ensureThreadCacheIsInitialized();
-
 		auto index = getBinIndex(sizeClass, containsPointers);
+		void* ptr;
+		if (likely(bins[index].allocate(ptr, wasZeroed))) {
+			return ptr;
+		}
+
+		return allocSmallBinSlow(sizeClass, slotSize, containsPointers, index,
+		                         wasZeroed);
+	}
+
+	void* allocSmallBinSlow(ubyte sizeClass, uint slotSize,
+	                        bool containsPointers, uint index,
+	                        ref bool wasZeroed) {
+		ensureThreadCacheIsInitialized();
 		auto bin = &bins[index];
 
 		void* ptr;
-		if (likely(bin.allocate(ptr, wasZeroed))) {
+		if (bin.allocate(ptr, wasZeroed)) {
 			return ptr;
 		}
 
@@ -973,9 +1013,17 @@ private:
 	/**
 	 * Large allocations.
 	 */
-	void* allocLarge(uint pages, bool containsPointers, bool zero) {
+	void* allocLarge(uint pages, bool containsPointers, bool zero,
+	                 size_t* outSize = null, uint* outAttr = null) {
 		auto e = allocLargeExtent(pages, containsPointers, zero);
-		return e is null ? null : e.address;
+		if (unlikely(e is null)) {
+			return null;
+		}
+		if (outSize !is null) {
+			*outSize = pages * PageSize;
+			*outAttr = containsPointers ? 0 : 0b0010;
+		}
+		return e.address;
 	}
 
 	/**
@@ -1009,12 +1057,12 @@ private:
 
 		auto nbytes = pages * PageSize;
 		triggerAllocationEvent(nbytes);
-		noteLastBlk(e.address, nbytes, containsPointers ? 0 : 0b0010);
 		return e;
 	}
 
-	void noteLastBlk(void* ptr, size_t blkSize, uint attr) nothrow {
-		lastBlkPtr = ptr;
+	pragma(inline, true)
+	void noteLastBlk(void* ptr, size_t blkSize, uint attr) nothrow @nogc {
+		lastBlkPtrInv = ~cast(size_t) ptr;
 		lastBlkSize = blkSize;
 		lastBlkAttr = attr;
 	}
@@ -1024,14 +1072,15 @@ public:
 	 * If `ptr` is the block this thread just allocated, return its BlkInfo
 	 * without an emap lookup. Clears the hit so a later free cannot observe it.
 	 */
-	bool consumeLastBlk(void* ptr, ref size_t blkSize, ref uint attr) nothrow {
-		if (ptr !is lastBlkPtr || ptr is null) {
+	pragma(inline, true)
+	bool consumeLastBlk(void* ptr, ref size_t blkSize, ref uint attr) nothrow @nogc {
+		if (ptr is null || (~cast(size_t) ptr) != lastBlkPtrInv) {
 			return false;
 		}
 
 		blkSize = lastBlkSize;
 		attr = lastBlkAttr;
-		lastBlkPtr = null;
+		lastBlkPtrInv = 0;
 		return true;
 	}
 
@@ -1042,8 +1091,11 @@ private:
 
 		auto e = pd.extent;
 		auto npages = e.npages;
-		if (e is appendLargeExtent) {
-			clearAppendLargeCache();
+		foreach (i; 0 .. AppendCacheCount) {
+			if (e is appendLargeExtent[i]) {
+				clearAppendLargeCache();
+				break;
+			}
 		}
 
 		{
@@ -1059,16 +1111,19 @@ private:
 	/**
 	 * Bytes accounting and bin maintenance.
 	 */
+	pragma(inline, true)
 	void triggerAllocationEvent(size_t bytes) {
 		allocated += bytes;
 
-		if (allocated >= nextAllocationEvent) {
-			reassociateArena();
-
-			recycleBins();
-
-			nextAllocationEvent = allocated + DefaultEventWait;
+		if (unlikely(allocated >= nextAllocationEvent)) {
+			triggerAllocationEventSlow();
 		}
+	}
+
+	void triggerAllocationEventSlow() {
+		reassociateArena();
+		recycleBins();
+		nextAllocationEvent = allocated + DefaultEventWait;
 	}
 
 	void triggerDeallocationEvent(size_t bytes) {
@@ -1092,6 +1147,7 @@ private:
 			// We only trigger recycling every 10ms.
 			return;
 		}
+		lastRecycleTime = now;
 
 		state.enterBusyState();
 		scope(exit) state.exitBusyState();
@@ -1269,25 +1325,32 @@ private:
 		auto epoch = gSlabFreeEpoch.load!(MemoryOrder.Relaxed)();
 
 		// Appending to a slot we appended to recently (2-way, for alternating ~=).
+		auto slicePtr = cast(size_t) slice.ptr;
 		if (appendEpoch == epoch) {
 			foreach (i; 0 .. AppendCacheCount) {
-				if (slice.ptr >= appendBase[i] && slice.ptr < appendEnd[i]
+				auto baseAddr = ~appendBaseInv[i];
+				auto endAddr = ~appendEndInv[i];
+				if (slicePtr >= baseAddr && slicePtr < endAddr
 					    && appendExtent[i] !is null) {
 					auto si = SlabAllocInfo(appendExtent[i], appendIndex[i],
 					                        appendSlotSize[i],
-					                        cast(void*) appendBase[i]);
+					                        cast(void*) baseAddr);
 					return resizeSlab!AdjustUsedCapacity(si, slice, size);
 				}
 			}
 		}
 
 		// Large appendable: same idea, skip the emap walk on the hot ~= path.
-		if (appendLargeExtent !is null && appendEpoch == epoch
-			    && slice.ptr >= appendLargeBase
-			    && slice.ptr < appendLargeBase
-			                    + (cast(size_t) appendLargePages) * PageSize) {
-			return resizeLarge!AdjustUsedCapacity(appendLargeExtent, null,
-			                                      slice, size, epoch);
+		if (appendEpoch == epoch) {
+			foreach (i; 0 .. AppendCacheCount) {
+				auto le = appendLargeExtent[i];
+				auto largeBase = ~appendLargeBaseInv[i];
+				if (le !is null && slicePtr >= largeBase
+					    && slicePtr < largeBase
+					                    + (cast(size_t) appendLargePages[i]) * PageSize) {
+					return resizeLarge!AdjustUsedCapacity(le, i, slice, size);
+				}
+			}
 		}
 
 		auto pd = maybeGetPageDescriptor(slice.ptr);
@@ -1300,8 +1363,8 @@ private:
 			auto si = SlabAllocInfo(pd, slice.ptr);
 			if (si.metadataSupported) {
 				auto i = appendCacheNext++ % AppendCacheCount;
-				appendBase[i] = si.address;
-				appendEnd[i] = si.address + si.slotBytes;
+				appendBaseInv[i] = ~cast(size_t) si.address;
+				appendEndInv[i] = ~cast(size_t) (si.address + si.slotBytes);
 				appendExtent[i] = si.slabExtent;
 				appendIndex[i] = si.slotIndex;
 				appendSlotSize[i] = si.slotBytes;
@@ -1311,12 +1374,16 @@ private:
 			return resizeSlab!AdjustUsedCapacity(si, slice, size);
 		}
 
-		return resizeLarge!AdjustUsedCapacity(e, &pd, slice, size, epoch);
+		auto li = appendLargeCacheNext++ % AppendCacheCount;
+		appendLargeBaseInv[li] = ~cast(size_t) e.address;
+		appendLargeExtent[li] = e;
+		appendLargePages[li] = e.npages;
+		appendEpoch = epoch;
+		return resizeLarge!AdjustUsedCapacity(e, li, slice, size);
 	}
 
-	bool resizeLarge(bool AdjustUsedCapacity)(Extent* e, PageDescriptor* pdp,
-	                                          const void[] slice, size_t size,
-	                                          uint epoch) {
+	bool resizeLarge(bool AdjustUsedCapacity)(Extent* e, size_t cacheIdx,
+	                                          const void[] slice, size_t size) {
 		auto usedCapacity = e.usedCapacity;
 		if (!validateCapacity(slice, e.address, usedCapacity)) {
 			return false;
@@ -1327,29 +1394,18 @@ private:
 
 		auto npages = getPageCount(newCapacity);
 		if (epages < npages) {
-			PageDescriptor pd;
-			if (pdp !is null) {
-				pd = *pdp;
-			} else {
-				pd = getPageDescriptor(cast(void*) e.address);
-			}
-
-			if (!growLarge(pd, npages)) {
+			if (!growLarge(e, npages)) {
 				return false;
 			}
 
 			triggerAllocationEvent((npages - epages) * PageSize);
-			appendLargePages = e.npages;
+			appendLargePages[cacheIdx] = e.npages;
 		}
 
 		if (AdjustUsedCapacity) {
 			e.setUsedCapacity(newCapacity);
 		}
 
-		appendLargeBase = e.address;
-		appendLargeExtent = e;
-		appendLargePages = e.npages;
-		appendEpoch = epoch;
 		return true;
 	}
 
@@ -1369,11 +1425,12 @@ private:
 		return newCapacity <= si.slotCapacity;
 	}
 
-	bool growLarge(PageDescriptor pd, uint npages) {
+	bool growLarge(Extent* e, uint npages) {
 		state.enterBusyState();
 		scope(exit) state.exitBusyState();
 
-		return pd.arena.growLarge(emap, pd.extent, npages);
+		import d.gc.arena;
+		return Arena.getInitialized(e.arenaIndex).growLarge(emap, e, npages);
 	}
 
 public:
@@ -1387,7 +1444,7 @@ public:
 			return true;
 		}
 
-		if (!growLarge(pd, npages)) {
+		if (!growLarge(pd.extent, npages)) {
 			return false;
 		}
 
@@ -1398,8 +1455,11 @@ public:
 private:
 
 	bool shrinkLarge(PageDescriptor pd, uint npages) {
-		if (pd.extent is appendLargeExtent) {
-			clearAppendLargeCache();
+		foreach (i; 0 .. AppendCacheCount) {
+			if (pd.extent is appendLargeExtent[i]) {
+				clearAppendLargeCache();
+				break;
+			}
 		}
 
 		state.enterBusyState();
@@ -1409,9 +1469,9 @@ private:
 	}
 
 	void clearAppendLargeCache() {
-		appendLargeBase = null;
-		appendLargeExtent = null;
-		appendLargePages = 0;
+		appendLargeBaseInv[] = 0;
+		appendLargeExtent[] = null;
+		appendLargePages[] = 0;
 	}
 
 	auto getPageDescriptor(void* ptr) {
@@ -1428,36 +1488,37 @@ private:
 	 */
 	auto getPageDescriptorCached(void* ptr) {
 		auto aptr = alignDown(ptr, PageSize);
-		if (likely(aptr is pdCachePage) && pdCachePD.extent !is null) {
+		auto aptrInv = ~cast(size_t) aptr;
+		if (likely(aptrInv == pdCachePageInv) && pdCachePD.extent !is null) {
 			return pdCachePD;
 		}
 
 		auto pd = getPageDescriptor(ptr);
-		pdCachePage = aptr;
+		pdCachePageInv = aptrInv;
 		pdCachePD = pd;
 		return pd;
 	}
 
 	/**
-	 * Per-bin page-descriptor cache for allocAppendable. Size-class churn on
-	 * paced frames keeps a single pdCachePage cold; each bin remembers its slab.
+	 * Per-bin slab-extent cache miss handler for allocAppendable. Caches the
+	 * slab's Extent*, inverted base address, and total slab byte span so
+	 * multi-page slabs hit across every page of the slab.
 	 */
-	auto getBinPageDescriptorCached(uint binIndex, void* ptr) {
+	Extent* cacheBinSlabExtent(uint binIndex, ubyte sc, void* ptr) {
 		assert(binIndex < ThreadBinCount, "Invalid bin index!");
 
 		auto aptr = alignDown(ptr, PageSize);
-		if (likely(aptr is binPageCache[binIndex])
-			    && binPdCache[binIndex].extent !is null) {
-			return binPdCache[binIndex];
-		}
+		auto pd = emap.lookup(aptr);
+		assert(pd.extent !is null && pd.isSlab());
 
-		auto pd = getPageDescriptor(ptr);
-		binPageCache[binIndex] = aptr;
-		binPdCache[binIndex] = pd;
-		// Keep the soft one-page cache warm for extend/shrink on the same page.
-		pdCachePage = aptr;
+		import d.gc.slab;
+		auto e = pd.extent;
+		binExtentCache[binIndex] = e;
+		binBaseInvCache[binIndex] = ~cast(size_t) e.address;
+		binSlabBytesCache[binIndex] = cast(uint) binInfos[sc].npages * PageSize;
+		pdCachePageInv = ~cast(size_t) aptr;
 		pdCachePD = pd;
-		return pd;
+		return e;
 	}
 
 	/**
@@ -1467,13 +1528,14 @@ private:
 	 */
 	public auto maybeGetPageDescriptorCached(void* ptr) {
 		auto aptr = alignDown(ptr, PageSize);
-		if (likely(aptr is pdCachePage) && pdCachePD.extent !is null) {
+		auto aptrInv = ~cast(size_t) aptr;
+		if (likely(aptrInv == pdCachePageInv) && pdCachePD.extent !is null) {
 			return pdCachePD;
 		}
 
 		auto pd = maybeGetPageDescriptor(ptr);
 		if (pd.extent !is null) {
-			pdCachePage = aptr;
+			pdCachePageInv = aptrInv;
 			pdCachePD = pd;
 		}
 		return pd;
@@ -1489,6 +1551,11 @@ private:
 		scope(exit) state.exitBusyState();
 
 		import d.gc.cpu, d.gc.thread;
+		if (!force && associatedArena < ArenaCount &&
+		    getRunningThreadCount() <= 2 * getCoreCount()) {
+			return;
+		}
+
 		if (getRunningThreadCount() > 2 * getCoreCount()) {
 			// When large number of thread are runnign, select arena
 			// based on the CPU core this trhead runs on.

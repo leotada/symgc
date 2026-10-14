@@ -62,11 +62,13 @@ struct Bin {
 		auto insert = bottom;
 
 		Refill: {
-			{
+			version(Symgc_lock_hist) {
 				import d.gc.gctime;
 				auto lockTimer = GcTimer.begin(GcTimeKind.BinLock);
 				mutex.lock();
 				lockTimer.end();
+			} else {
+				mutex.lock();
 			}
 
 			scope(exit) mutex.unlock();
@@ -91,8 +93,14 @@ struct Bin {
 							freshSlab.sweepTag = epoch;
 						}
 
-						slabs.insert(freshSlab);
+						uint nfill = (top - insert) & uint.max;
+						insert = freshSlab.batchAllocate(insert, nfill, slotSize);
+						if (freshSlab.nfree > 0) {
+							slabs.insert(freshSlab);
+						}
+
 						freshSlab = null;
+						progressed = true;
 						continue;
 					}
 
@@ -146,11 +154,13 @@ struct Bin {
 			return insert;
 		}
 
-		{
+		version(Symgc_lock_hist) {
 			import d.gc.gctime;
 			auto slabTimer = GcTimer.begin(GcTimeKind.FreshSlab);
 			freshSlab = filler.allocSlab(emap, sizeClass);
 			slabTimer.end();
+		} else {
+			freshSlab = filler.allocSlab(emap, sizeClass);
 		}
 
 		assert(freshSlab is null || freshSlab.nfree == nslots);

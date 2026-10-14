@@ -1081,6 +1081,7 @@ public:
 	}
 
 private:
+	pragma(inline, true)
 	static bool markDense(PageDescriptor pd, uint index) {
 		auto e = pd.extent;
 
@@ -1099,11 +1100,13 @@ private:
 		return e.markDenseSlot(index);
 	}
 
+	pragma(inline, true)
 	static bool markSparse(PageDescriptor pd, uint index, ubyte cycle) {
 		auto e = pd.extent;
 		return e.markSparseSlot(cycle, index);
 	}
 
+	pragma(inline, true)
 	static bool markLarge(PageDescriptor pd, ubyte cycle) {
 		auto e = pd.extent;
 		return e.markLarge(cycle);

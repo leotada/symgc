@@ -390,15 +390,15 @@ package:
 	}
 
 	auto makeLargeAlloc(uint pages) {
-		auto ptr = arena.allocLarge(emap, pages, false);
-		assert(ptr !is null);
+		auto e = arena.allocLarge(emap, pages, false);
+		assert(e !is null);
+		auto ptr = e.address;
 
 		expectedUsedPages += pages;
 		assert(filler.usedPages == expectedUsedPages);
 
 		auto pd = emap.lookup(ptr);
-		auto e = pd.extent;
-		assert(e !is null);
+		assert(pd.extent is e);
 		assert(e.address is ptr);
 		assert(e.npages == pages);
 
@@ -472,15 +472,15 @@ package:
 	}
 
 	auto makeLargeAlloc(uint pages) {
-		auto ptr = arena.allocLarge(emap, pages, false);
-		assert(ptr !is null);
+		auto e = arena.allocLarge(emap, pages, false);
+		assert(e !is null);
+		auto ptr = e.address;
 
 		expectedUsedPages += pages;
 		assert(filler.usedPages == expectedUsedPages);
 
 		auto pd = emap.lookup(ptr);
-		auto e = pd.extent;
-		assert(e !is null);
+		assert(pd.extent is e);
 		assert(e.address is ptr);
 		assert(e.npages == pages);
 
@@ -635,15 +635,15 @@ package:
 	}
 
 	auto makeLargeAlloc(uint pages) {
-		auto ptr = arena.allocLarge(emap, pages, false);
-		assert(ptr !is null);
+		auto e = arena.allocLarge(emap, pages, false);
+		assert(e !is null);
+		auto ptr = e.address;
 
 		expectedUsedPages += pages;
 		assert(filler.usedPages == expectedUsedPages);
 
 		auto pd = emap.lookup(ptr);
-		auto e = pd.extent;
-		assert(e !is null);
+		assert(pd.extent is e);
 		assert(e.address is ptr);
 		assert(e.npages == pages);
 

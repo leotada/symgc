@@ -53,19 +53,27 @@ struct GcTimer {
 	ulong innerAtStart;
 	GcTimeKind kind;
 
+	pragma(inline, true)
 	static GcTimer begin(GcTimeKind kind) {
+		if (tIsGcThread) {
+			return GcTimer(0, 0, kind);
+		}
+
 		import d.gc.time;
 		return GcTimer(getMonotonicTime(), tGcTimeSum, kind);
 	}
 
+	pragma(inline, true)
 	void end() {
+		if (tIsGcThread) {
+			return;
+		}
+
 		import d.gc.time;
 		auto elapsed = getMonotonicTime() - start;
 		auto inner = tGcTimeSum - innerAtStart;
 		version(Symgc_lock_hist) {
-			if (!tIsGcThread) {
-				lockHist(kind, elapsed);
-			}
+			lockHist(kind, elapsed);
 		}
 
 		record(kind, elapsed > inner ? elapsed - inner : 0);
@@ -179,8 +187,8 @@ void readThread(ulong* dst) {
 }
 
 void readTotal(ulong* dst) {
-	import core.atomic : atomicLoad;
+	import core.atomic : atomicLoad, MemoryOrder;
 	foreach (i; 0 .. GcTimeKindCount) {
-		dst[i] = atomicLoad(gGcTimeTotal[i]) * 100;
+		dst[i] = atomicLoad!(MemoryOrder.raw)(gGcTimeTotal[i]) * 100;
 	}
 }

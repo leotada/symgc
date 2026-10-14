@@ -272,6 +272,8 @@ struct Collector {
 	}
 
 	void runGCCycle() {
+		threadCache.flush();
+
 		/**
 		 * An explicit collection is synchronous: let a running background
 		 * sweep end first, it needs the collector lock to finish, so we
@@ -639,9 +641,11 @@ private:
 			if (lastPages <= RemarkPages) {
 				// What is left is little: the remark pause will do it.
 				// Put it back for the pause to find.
-				markRoundGC(gcCycle, space, (shared(Scanner)* s) {
-					list.seed(s);
-				});
+				if (lastPages > 0) {
+					markRoundGC(gcCycle, space, (shared(Scanner)* s) {
+						list.seed(s);
+					});
+				}
 				break;
 			}
 
@@ -676,7 +680,7 @@ private:
 		list.clear();
 		auto remarkPages = dirtyCollect((const(void)* start, size_t size) {
 			list.add(start, size);
-		});
+		}, false);
 		auto tR2 = getMonotonicTime();
 
 		version(Symgc_phase_trace) {
@@ -1129,6 +1133,20 @@ CollectionInfo lastCollectionInfo() {
 }
 
 /**
+ * Lock-free snapshot of last-collection counters for `GC.frameStats()`.
+ * Taking `gCollectorState.mutex` twice per frame contends with the sweeper's
+ * `completeAsyncCycle` and blocks mutators at frame boundaries.
+ */
+void lastCollectionStatsFast(out size_t usedPages, out size_t freeBytes,
+                             out size_t numCollections) nothrow @nogc {
+	import core.atomic : atomicLoad, MemoryOrder;
+	auto s = cast(const shared CollectorState*) &gCollectorState;
+	usedPages = atomicLoad!(MemoryOrder.acq)(s.lastCollectionInfo.usedPages);
+	freeBytes = atomicLoad!(MemoryOrder.acq)(s.lastCollectionInfo.freeBytes);
+	numCollections = cast(size_t) atomicLoad!(MemoryOrder.acq)(s.numCollections);
+}
+
+/**
  * The totals of all the cycles since the start, five values: the number of
  * collections, the time spent collecting, the time threads were paused, and
  * the longest pause and collection (100 ns).
@@ -1389,8 +1407,8 @@ private:
 	ulong maxPauseTime;
 	ulong maxCollectionTime;
 
-	size_t amortizedHeapSize = DefaultMinHeapSize;
-	size_t peakHeapSize = DefaultMinHeapSize;
+	size_t amortizedHeapSize = 0;
+	size_t peakHeapSize = 0;
 
 	/**
 	 * Track the targets to meet before collecting.
@@ -1475,12 +1493,13 @@ private:
 			lastTargetAdjustment = now;
 		}
 
+		auto floorTarget = max(2 * lastCollectionInfo.usedPages, minHeapSize);
 		while (now - lastTargetAdjustment >= interval) {
 			auto delta = nextTarget - lastCollectionInfo.usedPages;
 			delta -= delta >> lgTargetDecay;
 			delta += lastCollectionInfo.usedPages >> (lgTargetDecay + lgMinOverhead);
 
-			auto newTarget = lastCollectionInfo.usedPages + delta;
+			auto newTarget = max(lastCollectionInfo.usedPages + delta, floorTarget);
 			if (newTarget == nextTarget) {
 				// Limit reached.
 				lastTargetAdjustment = now;
@@ -1565,12 +1584,9 @@ private:
 		// Baseline target at 2x so we don't shrink the heap too fast.
 		auto tbaseline = 2 * amortizedHeapSize;
 
-		// We set the target at 2x the current heap size.
-		auto target = 2 * lastCollectionInfo.usedPages;
-
-		// Clamp the target using tpeak and tbaseline.
-		target = max(target, tbaseline);
-		target = min(target, tpeak);
+		// We set the target at 2x the current heap size, or keep it elevated
+		// at min(tbaseline, tpeak) when live size drops after a peak.
+		auto target = max(2 * lastCollectionInfo.usedPages, min(tbaseline, tpeak));
 
 		// Clamp the target based on configuration.
 		target = max(target, minHeapSize);

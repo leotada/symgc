@@ -71,11 +71,13 @@ public:
 	}
 
 	// Allocate without moving the low water mark.
+	pragma(inline, true)
 	bool allocateEasy(ref void* ptr) {
 		return allocateImpl!false(ptr);
 	}
 
 	// Allocate and move the low water mark if necessary.
+	pragma(inline, true)
 	bool allocate(ref void* ptr) {
 		return allocateImpl!true(ptr);
 	}
@@ -83,6 +85,7 @@ public:
 	/**
 	 * Like allocate, and set `wasZeroed` if this slot was memset on free.
 	 */
+	pragma(inline, true)
 	bool allocate(ref void* ptr, ref bool wasZeroed) {
 		if (!allocateImpl!true(ptr)) {
 			wasZeroed = false;
@@ -103,6 +106,14 @@ public:
 	            ref ThreadBinState state, ubyte sizeClass, size_t slotSize) {
 		auto nfill = state.getFill(nmax);
 		assert(nfill > 0);
+
+		import d.gc.slab;
+		auto nslots = binInfos[sizeClass].nslots;
+		if (nfill > nslots) {
+			// Round down to a multiple of nslots so FreshSlab fills whole
+			// slabs without leaving a gap below _head that must be shifted.
+			nfill = (nfill / nslots) * nslots;
+		}
 
 		auto insert = _head - nfill;
 		assert(available <= insert);
@@ -147,6 +158,12 @@ public:
 		 */
 		while (filled > insert) {
 			*(--_head) = *(--filled);
+		}
+
+		// Clear leftover pointers in [insert .. _head) so conservative TLS
+		// root scanning does not retain them.
+		for (auto p = insert; p < _head; p++) {
+			*p = null;
 		}
 
 		assert(insert <= _head);
@@ -202,6 +219,7 @@ public:
 	bool flush(ref CachedExtentMap emap, uint nretain) {
 		auto size = ncached;
 		if (nretain >= size) {
+			finalizeFlush(_head, size);
 			return false;
 		}
 
@@ -264,19 +282,22 @@ public:
 	}
 
 private:
+	pragma(inline, true)
 	@property
-	ushort current() const {
+	ushort current() const nothrow @nogc {
 		auto c = cast(size_t) _head;
 		return c & ushort.max;
 	}
 
+	pragma(inline, true)
 	@property
-	bool empty() const {
+	bool empty() const nothrow @nogc {
 		return current == _top;
 	}
 
+	pragma(inline, true)
 	@property
-	bool full() const {
+	bool full() const nothrow @nogc {
 		return current == _available;
 	}
 
@@ -327,14 +348,16 @@ private:
 	 * in the cache, and we don't want to cause a stall on success if
 	 * the value wasn't in cache.
 	 */
-	bool allocateImpl(bool AdjustLowWater)(ref void* ptr) {
+	pragma(inline, true)
+	bool allocateImpl(bool AdjustLowWater)(ref void* ptr) nothrow @nogc {
 		auto c = current;
-		ptr = *_head;
 
 		// We do not need to adjust the low water mark.
 		// Assuming the low water mark is a valid value, checking against it
 		// also ensures the bin is not empty.
 		if (likely(c != _low_water)) {
+			ptr = *_head;
+			*_head = null;
 			_head++;
 			return true;
 		}
@@ -346,6 +369,8 @@ private:
 		}
 
 		// The bin isn't empty, but the low water mark needs to be adjusted.
+		ptr = *_head;
+		*_head = null;
 		_head++;
 		_low_water += PointerSize;
 		return true;

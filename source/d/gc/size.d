@@ -3,10 +3,13 @@ module d.gc.size;
 import d.gc.sizeclass;
 import d.gc.spec;
 
+nothrow:
+
 // We make sure we can count allocated pages on a uint.
 enum MaxAllocationSize = uint.max * PageSize;
 
 // Determine whether given size is permitted by allocator.
+pragma(inline, true)
 bool isAllocatableSize(size_t size) {
 	return size > 0 && size <= MaxAllocationSize;
 }
@@ -28,6 +31,7 @@ enum MaxLargeSize = getSizeFromClass(ClassCount.Large - 1);
 enum MaxPagesInLargeAlloc = getPageCount(MaxLargeSize);
 
 // Determine whether given size may fit into a 'small' (slab-allocatable) size class.
+pragma(inline, true)
 bool isSmallSize(size_t size) {
 	return (size > 0) && (size <= MaxSmallSize);
 }

@@ -123,14 +123,14 @@ void dirtyArm() {
 
 /**
  * Call `dg` with every range written since the last `dirtyArm` or
- * `dirtyCollect`, and mark those pages as unwritten again. Returns the number
- * of pages reported.
+ * `dirtyCollect`, and (when `rearm` is true) mark those pages as unwritten
+ * again. Returns the number of pages reported.
  */
-size_t dirtyCollect(scope DirtyRangeDg dg) {
+size_t dirtyCollect(scope DirtyRangeDg dg, bool rearm = true) {
 	version(Symgc_cards) {
 		return gCardRanges.collect(dg);
 	} else version(DirtyTracking) {
-		return gDirty.collect(dg);
+		return gDirty.collect(dg, rearm);
 	} else {
 		return 0;
 	}
@@ -241,11 +241,11 @@ shared:
 		(cast(DirtyTracker*) &this).registerImpl(start, size);
 	}
 
-	size_t collect(scope DirtyRangeDg dg) {
+	size_t collect(scope DirtyRangeDg dg, bool rearm = true) {
 		mutex.lock();
 		scope(exit) mutex.unlock();
 
-		return (cast(DirtyTracker*) &this).collectImpl(dg);
+		return (cast(DirtyTracker*) &this).collectImpl(dg, rearm);
 	}
 }
 
@@ -379,7 +379,7 @@ void registerImpl(DirtyTracker* t, void* start, size_t size) {
 	t.ranges[t.count++] = Range(cast(size_t) start, size);
 }
 
-size_t collectImpl(DirtyTracker* t, scope DirtyRangeDg dg) {
+size_t collectImpl(DirtyTracker* t, scope DirtyRangeDg dg, bool rearm = true) {
 	assert(t.mutex.isHeld(), "Mutex not held!");
 
 	if (!t.available) {
@@ -408,7 +408,7 @@ size_t collectImpl(DirtyTracker* t, scope DirtyRangeDg dg) {
 		while (cursor < end) {
 			pm_scan_arg arg;
 			arg.size = pm_scan_arg.sizeof;
-			arg.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
+			arg.flags = PM_SCAN_CHECK_WPASYNC | (rearm ? PM_SCAN_WP_MATCHING : 0);
 			arg.start = cursor;
 			arg.end = end;
 			arg.vec = cast(size_t) vec.ptr;

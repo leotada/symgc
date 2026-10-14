@@ -346,16 +346,16 @@ public:
 
 		auto mask = uint.max << allocClass;
 
-		{
+		version(Symgc_lock_hist) {
 			import d.gc.gctime;
 			auto lockTimer = GcTimer.begin(GcTimeKind.FillerLock);
 			mutex.lock();
 			lockTimer.end();
-			version(Symgc_lock_hist) {
-				import d.gc.time;
-				holderHist(lastHolder, getMonotonicTime() - lockTimer.start);
-				lastHolder = 1;
-			}
+			import d.gc.time;
+			holderHist(lastHolder, getMonotonicTime() - lockTimer.start);
+			lastHolder = 1;
+		} else {
+			mutex.lock();
 		}
 
 		scope(exit) mutex.unlock();
@@ -369,16 +369,16 @@ public:
 		uint extraBlocks = (pages - 1) / PagesInBlock;
 		pages = modUp(pages, PagesInBlock);
 
-		{
+		version(Symgc_lock_hist) {
 			import d.gc.gctime;
 			auto lockTimer = GcTimer.begin(GcTimeKind.FillerLock);
 			mutex.lock();
 			lockTimer.end();
-			version(Symgc_lock_hist) {
-				import d.gc.time;
-				holderHist(lastHolder, getMonotonicTime() - lockTimer.start);
-				lastHolder = 1;
-			}
+			import d.gc.time;
+			holderHist(lastHolder, getMonotonicTime() - lockTimer.start);
+			lastHolder = 1;
+		} else {
+			mutex.lock();
 		}
 
 		scope(exit) mutex.unlock();
@@ -1412,7 +1412,7 @@ private:
 	bool minimizeStepImpl(ushort serial) {
 		assert(mutex.isHeld(), "Mutex not held!");
 
-		if (minimizeCur is null) {
+		while (minimizeCur is null) {
 			auto block = nextSweepBlock(serial);
 			if (block is null) {
 				return false;
@@ -1420,12 +1420,12 @@ private:
 
 			auto n = block.purgeablePages;
 			if (n == 0) {
-				return true;
+				continue;
 			}
 
 			if (n <= sweepRetain) {
 				sweepRetain -= n;
-				return true;
+				continue;
 			}
 
 			minimizeCur = block;
@@ -1632,9 +1632,9 @@ private:
 					}
 
 					if (sweepCurrent is null) {
-						auto tO0 = getMonotonicTime();
+						version(Symgc_phase_trace) auto tO0 = getMonotonicTime();
 						collectOutlinedBitmaps();
-						gSweepT[2] += getMonotonicTime() - tO0;
+						version(Symgc_phase_trace) gSweepT[2] += getMonotonicTime() - tO0;
 
 						sweepPhase = DenseMinimize;
 						sweepNext = denseBlocks.first;
@@ -1649,14 +1649,14 @@ private:
 					return true;
 
 				case DenseMinimize:
-					auto tM0 = getMonotonicTime();
+					version(Symgc_phase_trace) auto tM0 = getMonotonicTime();
 					if (!minimizeStepImpl(minimizeSerial)) {
 						sweepPhase = SparseScan;
 						sweepNext = sparseBlocks.first;
 						continue;
 					}
 
-					gSweepT[3] += getMonotonicTime() - tM0;
+					version(Symgc_phase_trace) gSweepT[3] += getMonotonicTime() - tM0;
 					return true;
 
 				case SparseScan:
@@ -1678,7 +1678,7 @@ private:
 					return true;
 
 				case SparseMinimize:
-					auto tM0 = getMonotonicTime();
+					version(Symgc_phase_trace) auto tM0 = getMonotonicTime();
 					if (!minimizeStepImpl(minimizeSerial)) {
 						sweepPhase = Idle;
 						sweepNext = null;
@@ -1699,7 +1699,7 @@ private:
 						return false;
 					}
 
-					gSweepT[6] += getMonotonicTime() - tM0;
+					version(Symgc_phase_trace) gSweepT[6] += getMonotonicTime() - tM0;
 					return true;
 			}
 		}
@@ -1860,6 +1860,18 @@ private:
 			version(Symgc_verify) {
 				poisonEvictedSlots(evicted[j], sc, e, j);
 			}
+		}
+
+		// Completely dead slab: no live slots exist so no mutator can free
+		// into it, and it is freed back to the filler without touching the bin.
+		if (occupancyPreview == 0) {
+			uint deadCount = 0;
+			foreach (j; 0 .. nimble) {
+				deadCount += popCount(evicted[j]);
+			}
+
+			stats.bytesCollected += deadCount * slotSize;
+			return true;
 		}
 
 		bin.mutex.lock();
@@ -2125,7 +2137,8 @@ private:
 	                       ref CollectStats stats) {
 		assert(mutex.isHeld(), "Mutex not held!");
 
-		PriorityExtentHeap deadExtents;
+		Extent*[PagesInBlock] deadExtents = void;
+		uint ndead = 0;
 		auto tD0 = getMonotonicTime();
 		auto deadline = tD0 + budget;
 
@@ -2183,20 +2196,48 @@ private:
 				assert(bmp !is null);
 
 				if (sweepSlab(e, sc, ec.supportsMetadata, bmp, cast(uint) nimble, gcCycle, stats)) {
-					deadExtents.insert(e);
+					deadExtents[ndead++] = e;
 				}
 			}
 		}
 
-		auto tD1 = getMonotonicTime();
+		version(Symgc_phase_trace) auto tD1 = getMonotonicTime();
 
 		// Freeing the last extent of the block releases the block itself,
 		// so nothing may touch it after this point.
-		while (!deadExtents.empty) {
-			freeExtentLocked(emap, deadExtents.pop());
+		if (ndead > 0) {
+			gSlabFreeEpoch.fetchAdd(1);
+			unregisterBlock(block);
+			size_t freedPages = 0;
+
+			foreach (k; 0 .. ndead - 1) {
+				auto de = deadExtents[k];
+				emap.clear(de);
+				block.release(de.blockIndex, de.npages);
+				freedPages += de.npages;
+				unusedExtents.insert(de);
+			}
+
+			auto lastE = deadExtents[ndead - 1];
+			emap.clear(lastE);
+			block.release(lastE.blockIndex, lastE.npages);
+			freedPages += lastE.npages;
+
+			if (block.empty) {
+				releaseBlock(lastE, block);
+			} else {
+				registerBlock(block);
+			}
+
+			usedPageCount.fetchSub(freedPages);
+			version(Symgc_phase_trace) gTracePagesFreed.fetchAdd(freedPages);
+			unusedExtents.insert(lastE);
 		}
 
-		gSweepT[0] += tD1 - tD0; gSweepT[1] += getMonotonicTime() - tD1;
+		version(Symgc_phase_trace) {
+			gSweepT[0] += tD1 - tD0;
+			gSweepT[1] += getMonotonicTime() - tD1;
+		}
 		return done;
 	}
 
@@ -2208,7 +2249,8 @@ private:
 	                        ref CollectStats stats) {
 		assert(mutex.isHeld(), "Mutex not held!");
 
-		PriorityExtentHeap deadExtents;
+		Extent*[PagesInBlock] deadExtents = void;
+		uint ndead = 0;
 		auto tS0 = getMonotonicTime();
 		auto deadline = tS0 + budget;
 
@@ -2264,7 +2306,7 @@ private:
 					}
 
 					stats.bytesCollected += e.npages;
-					deadExtents.insert(e);
+					deadExtents[ndead++] = e;
 					continue;
 				}
 
@@ -2273,16 +2315,60 @@ private:
 				marks[0] = e.getMarksSparse(gcCycle);
 
 				if (sweepSlab(e, ec.sizeClass, true, marks.ptr, 1, gcCycle, stats)) {
-					deadExtents.insert(e);
+					deadExtents[ndead++] = e;
 				}
 			}
 		}
 
-		auto tS1 = getMonotonicTime();
-		while (!deadExtents.empty) {
-			freeExtentLocked(emap, deadExtents.pop());
+		version(Symgc_phase_trace) auto tS1 = getMonotonicTime();
+		if (ndead > 0) {
+			// Huge extents (> PagesInBlock) may unlock mutex to release
+			// extra regions; handle them via freeExtentLocked if present.
+			bool anyHuge = false;
+			foreach (k; 0 .. ndead) {
+				if (unlikely(deadExtents[k].npages > PagesInBlock)) {
+					anyHuge = true;
+					break;
+				}
+			}
+
+			if (unlikely(anyHuge)) {
+				foreach (k; 0 .. ndead) {
+					freeExtentLocked(emap, deadExtents[k]);
+				}
+			} else {
+				gSlabFreeEpoch.fetchAdd(1);
+				unregisterBlock(block);
+				size_t freedPages = 0;
+
+				foreach (k; 0 .. ndead - 1) {
+					auto de = deadExtents[k];
+					emap.clear(de);
+					block.release(de.blockIndex, de.npages);
+					freedPages += de.npages;
+					unusedExtents.insert(de);
+				}
+
+				auto lastE = deadExtents[ndead - 1];
+				emap.clear(lastE);
+				block.release(lastE.blockIndex, lastE.npages);
+				freedPages += lastE.npages;
+
+				if (block.empty) {
+					releaseBlock(lastE, block);
+				} else {
+					registerBlock(block);
+				}
+
+				usedPageCount.fetchSub(freedPages);
+				version(Symgc_phase_trace) gTracePagesFreed.fetchAdd(freedPages);
+				unusedExtents.insert(lastE);
+			}
 		}
-		gSweepT[4] += tS1 - tS0; gSweepT[5] += getMonotonicTime() - tS1;
+		version(Symgc_phase_trace) {
+			gSweepT[4] += tS1 - tS0;
+			gSweepT[5] += getMonotonicTime() - tS1;
+		}
 		return done;
 	}
 

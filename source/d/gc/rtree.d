@@ -55,12 +55,14 @@ private:
 		Atomic!ulong data;
 
 	public:
+		pragma(inline, true)
 		void store(T value) shared {
-			data.store(value.toLeafPayload());
+			data.store!(MemoryOrder.Release)(value.toLeafPayload());
 		}
 
+		pragma(inline, true)
 		auto load() shared {
-			return T(data.load());
+			return T(data.load!(MemoryOrder.Acquire)());
 		}
 	}
 
@@ -69,12 +71,14 @@ private:
 		Atomic!size_t data;
 
 	public:
+		pragma(inline, true)
 		auto getLeaves() shared {
-			return cast(Leaves) data.load();
+			return cast(Leaves) data.load!(MemoryOrder.Acquire)();
 		}
 	}
 
 public:
+	pragma(inline, true)
 	shared(Leaf)* get(ref Cache cache, void* address) shared {
 		// FIXME: in contract.
 		assert(isValidAddress(address));
@@ -84,7 +88,7 @@ public:
 			return null;
 		}
 
-		return &(*leaves)[subKey(address, 1)];
+		return &(*leaves)[subKey!1(address)];
 	}
 
 	bool set(ref Cache cache, void* address, T value,
@@ -119,7 +123,7 @@ public:
 
 			import d.gc.util;
 			auto nextPtr = alignUp(ptr + 1, Level0Align);
-			auto key1 = subKey(ptr, 1);
+			auto key1 = subKey!1(ptr);
 
 			auto subStop = stop < nextPtr ? stop : nextPtr;
 			while (ptr < subStop) {
@@ -162,7 +166,7 @@ public:
 				continue;
 			}
 
-			auto key1 = subKey(ptr, 1);
+			auto key1 = subKey!1(ptr);
 
 			// Windows does not have an atomic way to zero large numbers of pages.
 			// So we cannot use pages_purge on Windows.
@@ -210,7 +214,16 @@ private:
 		return &(*leaves)[subKey(address, 1)];
 	}
 
+	pragma(inline, true)
 	auto getLeaves(ref Cache cache, void* address) shared {
+		assert(isValidAddress(address));
+
+		auto key0 = subKey!0(address);
+		auto e = cache.l1[key0 % Cache.L1Size];
+		if (likely(e.key == key0)) {
+			return e.leaves;
+		}
+
 		return getLeavesImpl!false(cache, address, null);
 	}
 
@@ -224,7 +237,7 @@ private:
 		// FIXME: in contract.
 		assert(isValidAddress(address));
 
-		auto key0 = subKey(address, 0);
+		auto key0 = subKey!0(address);
 		auto leaves = cache.lookup(key0);
 		if (likely(leaves !is null)) {
 			assert(leaves is nodes[key0].getLeaves(),
@@ -397,6 +410,21 @@ bool isValidAddress(void* address) {
 	}
 
 	checkIsValid(PageSize << SignificantBits, false);
+}
+
+pragma(inline, true)
+static size_t subKey(uint level)(void* ptr) {
+	assert(isValidAddress(ptr), "Invalid ptr!");
+
+	enum shift = (level == 0)
+		? (LgAddressSpace - SignificantBits / 2)
+		: LgPageSize;
+	enum bits = (level == 0)
+		? (SignificantBits / 2)
+		: (SignificantBits / 2 + SignificantBits % 2);
+	enum mask = (size_t(1) << bits) - 1;
+
+	return ((cast(size_t) ptr) >> shift) & mask;
 }
 
 static subKey(void* ptr, uint level) {

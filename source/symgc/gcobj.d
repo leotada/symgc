@@ -312,18 +312,13 @@ final class SnazzyGC : SnazzyBases
 			size = qallocNoScanFloor;
 		}
 
-		auto ptr = sdcAllocate(size, bits, false, ti);
-
+		size_t blkSize;
+		uint attr;
+		auto ptr = sdcAllocate(size, bits, false, ti, &blkSize, &attr);
 		if (!ptr)
 			return BlkInfo.init;
 
-		// Appender/format call qalloc then read bi.size. Re-walking the emap
-		// for a block this thread just made was the dominant cost on small
-		// NO_SCAN appendable allocs; serve BlkInfo from the thread cache.
-		import d.gc.tcache;
-		size_t blkSize;
-		uint attr;
-		if (threadCache.consumeLastBlk(ptr, blkSize, attr)) {
+		if (blkSize != 0) {
 			BlkInfo bi;
 			bi.base = ptr;
 			bi.size = blkSize;
@@ -490,17 +485,21 @@ final class SnazzyGC : SnazzyBases
 
 		fs.isCycleActive = (gMarkActive.load() != 0) || (gSweepCycle.load() != 0);
 
-		auto s = this.stats();
+		import d.gc.collector : lastCollectionStatsFast;
 		import d.gc.arena : Arena;
 		import d.gc.spec : PageSize;
+		size_t lastUsedPages;
+		size_t freeBytes;
+		size_t numColls;
+		() @trusted nothrow @nogc {
+			lastCollectionStatsFast(lastUsedPages, freeBytes, numColls);
+		}();
 		size_t activeUsed = () @trusted nothrow @nogc {
 			return (cast(size_t function() nothrow @nogc)&Arena.computeUsedPageCount)() * PageSize;
 		}();
-		fs.usedSize = activeUsed > 0 ? activeUsed : s.usedSize;
-		fs.freeSize = s.freeSize;
-
-		auto ps = this.profileStats();
-		fs.numCollections = ps.numCollections;
+		fs.usedSize = activeUsed > 0 ? activeUsed : lastUsedPages * PageSize;
+		fs.freeSize = freeBytes;
+		fs.numCollections = numColls;
 
 		return fs;
 	}
@@ -702,6 +701,7 @@ size_t extendLarge(void* p, size_t minsize, size_t maxsize)
 	return e.size;
 }
 
+pragma(inline, true)
 void* getContextPointer(uint bits, const TypeInfo ti) nothrow @nogc
 {
 	if (bits & BlkAttr.FINALIZE) {
@@ -716,6 +716,7 @@ void* getContextPointer(uint bits, const TypeInfo ti) nothrow @nogc
  * allocation from it would wait for itself forever. It is an error in D too:
  * the other collectors throw InvalidMemoryOperationError.
  */
+pragma(inline, true)
 void checkNotInFinalizer() nothrow
 {
 	import d.gc.tcache;
@@ -725,7 +726,9 @@ void checkNotInFinalizer() nothrow
 	}
 }
 
-void *sdcAllocate(size_t size, uint bits, bool zeroData, const TypeInfo ti) nothrow
+pragma(inline, true)
+void *sdcAllocate(size_t size, uint bits, bool zeroData, const TypeInfo ti,
+                  size_t* outSize = null, uint* outAttr = null) nothrow
 {
 	checkNotInFinalizer();
 
@@ -736,10 +739,28 @@ void *sdcAllocate(size_t size, uint bits, bool zeroData, const TypeInfo ti) noth
 
 	bool containsPointers = (bits & BlkAttr.NO_SCAN) == 0;
 
+	import d.gc.tcache;
 	if ((bits & BlkAttr.APPENDABLE) || ctx)
-		return __sd_gc_hook_alloc_appendable(size + 1, containsPointers, zeroData, ctx);
+		return (cast(void* function(ref ThreadCache, size_t, bool, bool, void*, size_t, size_t*, uint*) nothrow)
+			&allocAppendableDirect)(threadCache, size + 1, containsPointers, zeroData, ctx, 0, outSize, outAttr);
 
-	return __sd_gc_hook_alloc(size, containsPointers, zeroData);
+	return (cast(void* function(ref ThreadCache, size_t, bool, bool, size_t*, uint*) nothrow)
+		&allocDirect)(threadCache, size, containsPointers, zeroData, outSize, outAttr);
+}
+
+private void* allocDirect(ref ThreadCache tc, size_t size, bool containsPointers,
+                          bool zeroData, size_t* outSize, uint* outAttr)
+{
+	return tc.alloc(size, containsPointers, zeroData, outSize, outAttr);
+}
+
+private void* allocAppendableDirect(ref ThreadCache tc, size_t size,
+                                    bool containsPointers, bool zeroData,
+                                    void* ctx, size_t capacity,
+                                    size_t* outSize, uint* outAttr)
+{
+	return tc.allocAppendable(size, containsPointers, zeroData, ctx, capacity,
+	                          outSize, outAttr);
 }
 
 // BEGIN C API HOOKS

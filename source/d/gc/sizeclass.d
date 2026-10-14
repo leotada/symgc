@@ -45,15 +45,15 @@ enum MaxTinySize = ClassCount.Tiny * Quantum;
 enum BinCount = ClassCount.Small;
 
 // Determine whether given size class is considered 'small' (slab-allocatable).
-bool isSmallSizeClass(uint sizeClass) {
+bool isSmallSizeClass(uint sizeClass) nothrow @nogc {
 	return sizeClass < ClassCount.Small;
 }
 
-bool isLargeSizeClass(uint sizeClass) {
+bool isLargeSizeClass(uint sizeClass) nothrow @nogc {
 	return sizeClass >= ClassCount.Small && sizeClass < ClassCount.Large;
 }
 
-bool isHugeSizeClass(uint sizeClass) {
+bool isHugeSizeClass(uint sizeClass) nothrow @nogc {
 	return sizeClass >= ClassCount.Large;
 }
 
@@ -168,7 +168,8 @@ size_t getAllocSize(size_t size) {
 	}
 }
 
-ubyte getSizeClass(size_t size) {
+pragma(inline, true)
+ubyte getSizeClass(size_t size) nothrow @nogc {
 	if (size <= MaxTinySize) {
 		auto ret = ((size + QuantumMask) >> LgQuantum) - 1;
 

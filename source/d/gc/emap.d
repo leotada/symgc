@@ -18,6 +18,7 @@ private:
 	ExtentMapTree tree;
 
 public:
+	pragma(inline, true)
 	PageDescriptor lookup(ref ExtentMapCache cache, void* address) shared {
 		auto leaf = tree.get(cache, address);
 		return leaf is null ? PageDescriptor(0) : leaf.load();
@@ -97,6 +98,7 @@ public:
 		this.base = base;
 	}
 
+	pragma(inline, true)
 	PageDescriptor lookup(void* address) {
 		return emap.lookup(cache, address);
 	}

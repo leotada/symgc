@@ -325,6 +325,7 @@ private:
  * Write the slot trailer only; the caller sets the extent metadata bit
  * (possibly batched).
  */
+pragma(inline, true)
 void writeNewSlotMetadataBody(Extent* e, uint index, uint slotSize, void* address,
                               Finalizer initialFinalizer,
                               size_t initialUsedCapacity) {
@@ -363,6 +364,7 @@ void writeNewSlotMetadataBody(Extent* e, uint index, uint slotSize, void* addres
 	}
 }
 
+pragma(inline, true)
 void writeNewSlotMetadata(Extent* e, uint index, uint slotSize, void* address,
                           Finalizer initialFinalizer,
                           size_t initialUsedCapacity) {
@@ -593,6 +595,7 @@ struct BinInfo {
 		this.mul = mulIndices[tag];
 	}
 
+	pragma(inline, true)
 	uint computeIndex(size_t offset) const {
 		// FIXME: in contract.
 		assert(offset < npages * PageSize, "Offset out of bounds!");

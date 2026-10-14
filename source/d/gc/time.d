@@ -10,9 +10,17 @@ enum ulong Hour = 60 * Minute;
 enum ulong Day = 24 * Hour;
 enum ulong Week = 7 * Day;
 
+pragma(inline, true)
 ulong getMonotonicTime() {
-	auto cur = MonoTime.currTime();
-	return (cur - MonoTime.zero).total!"hnsecs";
+	version(Posix) {
+		import core.sys.posix.time : clock_gettime, CLOCK_MONOTONIC, timespec;
+		timespec ts = void;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		return cast(ulong) ts.tv_sec * 10_000_000UL + cast(ulong) ts.tv_nsec / 100UL;
+	} else {
+		auto cur = MonoTime.currTime();
+		return (cur - MonoTime.zero).total!"hnsecs";
+	}
 }
 
 /**
